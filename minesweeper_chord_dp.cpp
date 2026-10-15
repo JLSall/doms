@@ -2271,6 +2271,43 @@ static bool connectivity_coarsens(const std::vector<uint64_t>& coarse,
     return true;
 }
 
+// For reverse dominance, require an exact quotient: each fine component has
+// one unambiguous coarse parent, and every coarse reach is precisely the union
+// of its assigned fine reaches. Merely being contained is insufficient: extra
+// coarse reach can join two future components without a corresponding join on
+// the fine side, exceeding the simple seed-count bound.
+static bool connectivity_exact_quotient(const std::vector<uint64_t>& coarse,
+                                        const std::vector<uint64_t>& fine,
+                                        size_t signature_words) {
+    const size_t coarse_count = coarse.size() / signature_words;
+    const size_t fine_count = fine.size() / signature_words;
+    if (coarse_count == 0 || coarse_count >= fine_count) return false;
+    if (coarse_count == 1) return true; // The enclosing union buckets agree.
+    std::vector<uint64_t> recovered(coarse.size(), 0);
+    for (size_t f = 0; f < fine_count; ++f) {
+        size_t parent = coarse_count;
+        for (size_t c = 0; c < coarse_count; ++c) {
+            bool contained = true;
+            for (size_t word = 0; word < signature_words; ++word) {
+                if ((fine[f * signature_words + word] &
+                     ~coarse[c * signature_words + word]) != 0) {
+                    contained = false;
+                    break;
+                }
+            }
+            if (!contained) continue;
+            if (parent != coarse_count) return false;
+            parent = c;
+        }
+        if (parent == coarse_count) return false;
+        for (size_t word = 0; word < signature_words; ++word) {
+            recovered[parent * signature_words + word] |=
+                fine[f * signature_words + word];
+        }
+    }
+    return recovered == coarse;
+}
+
 template <typename FactorBits, bool TrackChosen>
 static size_t prune_dominated(FactorTable<FactorBits, TrackChosen>& table,
                               uint64_t comparison_limit,
@@ -2382,6 +2419,8 @@ static size_t prune_dominated(FactorTable<FactorBits, TrackChosen>& table,
     std::vector<std::vector<CachedItem*>> survivors(connectivity_count);
     std::vector<int> minimum_quasi(connectivity_count, std::numeric_limits<int>::max());
     std::vector<int> maximum_quasi(connectivity_count, std::numeric_limits<int>::min());
+    std::vector<int> minimum_cost(connectivity_count, std::numeric_limits<int>::max());
+    std::vector<int> maximum_cost(connectivity_count, std::numeric_limits<int>::min());
     for (uint32_t id = 0; id < connectivity_count; ++id) {
         survivors[id].reserve(state_counts[id]);
     }
@@ -2423,6 +2462,10 @@ static size_t prune_dominated(FactorTable<FactorBits, TrackChosen>& table,
                     std::min(minimum_quasi[connectivity_id], cached.quasi_score);
                 maximum_quasi[connectivity_id] =
                     std::max(maximum_quasi[connectivity_id], cached.quasi_score);
+                minimum_cost[connectivity_id] =
+                    std::min(minimum_cost[connectivity_id], cached.item->second.cost);
+                maximum_cost[connectivity_id] =
+                    std::max(maximum_cost[connectivity_id], cached.item->second.cost);
             }
         }
     }
@@ -2540,6 +2583,62 @@ static size_t prune_dominated(FactorTable<FactorBits, TrackChosen>& table,
             }
             cached->cross_dominated = is_dominated;
             if (exhausted) break;
+        }
+    }
+
+
+    // Reverse connectivity dominance: a cheaper finer state can dominate a
+    // coarser state even if their future chords never reunite its pieces. The
+    // maximum extra seed cost is the difference in live component counts.
+    // Run this after the usual pass so its comparisons cannot displace the
+    // established coarsening checks within the layer's comparison budget.
+    if (!exhausted) {
+        for (uint32_t coarse_id = 0; coarse_id < connectivity_count && !exhausted;
+             ++coarse_id) {
+            if (survivors[coarse_id].empty()) continue;
+            const auto& bucket = buckets[connectivity_bucket[coarse_id]];
+            for (uint32_t fine_id : bucket.connectivity_ids) {
+                if (component_counts[fine_id] <= component_counts[coarse_id] ||
+                    survivors[fine_id].empty()) continue;
+                const int extra_seeds = static_cast<int>(
+                    component_counts[fine_id] - component_counts[coarse_id]);
+                if (minimum_cost[fine_id] + extra_seeds > maximum_cost[coarse_id] ||
+                    minimum_quasi[fine_id] + extra_seeds > maximum_quasi[coarse_id]) {
+                    continue;
+                }
+                if (!connectivity_exact_quotient(connectivity_pool[coarse_id],
+                                                 connectivity_pool[fine_id],
+                                                 signature_words)) {
+                    continue;
+                }
+                for (CachedItem* target : survivors[coarse_id]) {
+                    if (target->cross_dominated) continue;
+                    for (CachedItem* candidate : survivors[fine_id]) {
+                        if (candidate->item->second.cost + extra_seeds >
+                            target->item->second.cost) continue;
+                        if (candidate->quasi_score + extra_seeds > target->quasi_score)
+                            continue;
+                        if (remaining == 0) {
+                            exhausted = true;
+                            break;
+                        }
+                        --remaining;
+                        const int allowance = target->item->second.cost -
+                            candidate->item->second.cost - extra_seeds;
+                        const int lower_bound =
+                            std::max(0, target->flag_hits - candidate->flag_hits) +
+                            std::max(0, candidate->base_hits - target->base_hits);
+                        if (lower_bound <= allowance && dominance_penalty_at_most(
+                                candidate->item->first.hits, target->item->first.hits,
+                                base_mask, allowance)) {
+                            target->cross_dominated = true;
+                            break;
+                        }
+                    }
+                    if (exhausted) break;
+                }
+                if (exhausted) break;
+            }
         }
     }
     const auto cross_end = profile ? std::chrono::steady_clock::now() : exact_end;
