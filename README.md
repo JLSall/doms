@@ -527,6 +527,9 @@ boundary slots. Standard boards therefore store each unfinished component in
 one or two 64-bit words rather than a bitset spanning every chord candidate;
 boundaries requiring more than 128 slots use the general representation.
 Connectivity transitions are cached per signature within each candidate step.
+Their state-hash prefixes are cached too: successors sharing connectivity only
+need to hash their factor bits. Opening absorption recomputes the prefix if it
+changes the successor's connectivity ID. The resulting hashes are unchanged.
 For one-word components, transitions sort the component words directly to
 canonicalize the signature, avoiding an offset sort and a separate copy.
 Count-only mode uses a separate template specialization that omits the chosen
@@ -567,6 +570,16 @@ remaining targets, refreshes the cost bounds when targets are removed, and
 stops comparing a target signature once its list is empty. Dominated states
 remain available as witnesses until all passes finish, preserving the same
 exact pruning decisions.
+
+Dominance setup's cached records point directly to stable DP table entries
+and derive the final sort field from their cached hit counts. On 64-bit builds
+this reduces each record from 48 to 32 bytes and reduces the data moved during
+sorting. Count-only mode also stores these records in one shared array, with
+a slice for each reachability bucket. Replay mode retains per-bucket buffers,
+which used less peak RSS with heap-backed chord histories in testing. Bucket
+sizes are accumulated while grouping signatures, avoiding a separate scan.
+See the [transition and setup benchmark notes](benchmarks/transition_setup_results.md)
+for measured timings, memory usage, test boards, and validation details.
 
 The common connectivity-matching path builds eligibility one fine component
 at a time. If a fine component has no containing coarse component, it rejects

@@ -2,6 +2,7 @@
 // C++17 port of minesweeper_chord_dp.py.
 
 #include <algorithm>
+#include <type_traits>
 #include <atomic>
 #include <array>
 #include <chrono>
@@ -2223,11 +2224,14 @@ public:
         }
     }
 
+    // state_hash must equal StateHash{}(state); transitions cache its
+    // connectivity prefix, shared by all states with that connectivity.
     // A transition needs to create a record only when its state is new. Probe
     // once, then construct the record lazily in the vacant slot; replay-mode
     // chosen histories can be large enough that eager copying is expensive.
     template <typename MakeRecord>
-    std::pair<iterator, bool> find_or_emplace(State state, MakeRecord&& make_record) {
+    std::pair<iterator, bool> find_or_emplace(State state, size_t state_hash,
+                                           MakeRecord&& make_record) {
         if (slots_.empty()) reserve(live_size_ + 1);
         // Probe before growing the index. Most generated successors can be
         // duplicates, and those lookups do not need insertion capacity.
@@ -2236,7 +2240,7 @@ public:
         // number of occupied slots.
         for (;;) {
             const size_t mask = slots_.size() - 1;
-            size_t slot = StateHash{}(state) & mask;
+            size_t slot = state_hash & mask;
             size_t first_deleted = std::numeric_limits<size_t>::max();
             for (;;) {
                 const uint32_t entry = slots_[slot];
@@ -2280,6 +2284,13 @@ public:
         std::vector<uint32_t>{}.swap(slots_);
         used_slots_ = 0;
         deleted_slots_ = 0;
+    }
+
+    // Pruning holds stable entry pointers: it never inserts into this table.
+    void erase(value_type* where) {
+        const size_t index = static_cast<size_t>(where - entries_.data());
+        if (index >= entries_.size() || !alive_[index]) return;
+        erase(iterator(this, index));
     }
 
     void erase(iterator where) {
@@ -2358,17 +2369,13 @@ private:
 struct ConnectivityTransition {
     uint32_t connectivity_id = 0;
     int closed = 0;
+    size_t hash_seed = 0;
 };
 
-using DominanceKey = std::pair<uint64_t, int>;
-
-static DominanceKey dominance_key(int cost, int base_hits, int total_hits) {
-    // Encode the two most selective signed fields in one unsigned comparison.
-    // The bit-31 flip preserves the order of signed 32-bit values exactly.
-    const uint64_t primary =
-        (uint64_t{static_cast<uint32_t>(cost + base_hits) ^ UINT32_C(0x80000000)} << 32) |
-        (static_cast<uint32_t>(cost) ^ UINT32_C(0x80000000));
-    return {primary, -total_hits};
+static uint64_t dominance_primary_key(int cost, int base_hits) {
+    // Pack the signed primary fields in their original lexicographic order.
+    return (uint64_t{static_cast<uint32_t>(cost + base_hits) ^ UINT32_C(0x80000000)} << 32) |
+           (static_cast<uint32_t>(cost) ^ UINT32_C(0x80000000));
 }
 
 // A coarser signature can represent several finer components as one, provided
@@ -2573,19 +2580,36 @@ static size_t prune_dominated(FactorTable<FactorBits, TrackChosen>& table,
     if (table.size() < 2) return 0;
     const auto profile_start = profile ? std::chrono::steady_clock::now() :
         std::chrono::steady_clock::time_point{};
-    using Item = typename FactorTable<FactorBits, TrackChosen>::iterator;
+    using Item = typename FactorTable<FactorBits, TrackChosen>::value_type*;
+    // Entries cannot move during pruning. Keep one direct pointer and derive
+    // the final sort field from the hit counts instead of storing it again.
+    // This makes the cache record 32 rather than 48 bytes on 64-bit builds.
     struct CachedItem {
         Item item;
-        DominanceKey key;
-        int base_hits = 0;
-        int flag_hits = 0;
-        int quasi_score = 0;
-        bool exact_dominated = false;
-        bool cross_dominated = false;
+        uint64_t key;
+        int base_hits;
+        int flag_hits;
+        int quasi_score;
+        bool exact_dominated;
+        bool cross_dominated;
+
+        bool key_before(const CachedItem& other) const {
+            if (key != other.key) return key < other.key;
+            // The last key field is -total_hits, already available here.
+            return base_hits + flag_hits > other.base_hits + other.flag_hits;
+        }
+    };
+    struct CachedList {
+        CachedItem* data = nullptr;
+        size_t count = 0;
+        CachedItem* begin() { return data; }
+        CachedItem* end() { return data + count; }
+        void push_back(CachedItem item) { data[count++] = item; }
     };
     struct Bucket {
         std::vector<uint32_t> connectivity_ids;
-        std::vector<CachedItem> entries;
+        std::conditional_t<TrackChosen, std::vector<CachedItem>, CachedList> entries;
+        size_t state_count = 0;
         // If two future boundary positions occur together in a fine component,
         // a coarsening must contain them together in some component too.
         std::unordered_map<uint16_t, std::vector<uint32_t>> pair_postings;
@@ -2635,12 +2659,7 @@ static size_t prune_dominated(FactorTable<FactorBits, TrackChosen>& table,
         if (new_bucket) buckets.emplace_back();
         connectivity_bucket[id] = bucket;
         buckets[bucket].connectivity_ids.push_back(id);
-    }
-    std::vector<size_t> bucket_state_counts(buckets.size(), 0);
-    for (uint32_t id = 0; id < connectivity_count; ++id) {
-        if (state_counts[id] != 0) {
-            bucket_state_counts[connectivity_bucket[id]] += state_counts[id];
-        }
+        buckets[bucket].state_count += state_counts[id];
     }
     if (signature_words == 1) {
         for (auto& bucket : buckets) {
@@ -2665,23 +2684,35 @@ static size_t prune_dominated(FactorTable<FactorBits, TrackChosen>& table,
             }
         }
     }
-    for (size_t bucket = 0; bucket < buckets.size(); ++bucket) {
-        buckets[bucket].entries.reserve(bucket_state_counts[bucket]);
+    // Bucket sizes are known: count-only mode can use one uninitialized POD
+    // array, with every slot assigned before sorting. Per-bucket vectors had
+    // lower peak RSS in replay benchmarks with heap-backed chord histories,
+    // so keep that allocation strategy when histories are present.
+    std::unique_ptr<CachedItem[]> cached_storage;
+    if constexpr (!TrackChosen) cached_storage.reset(new CachedItem[table.size()]);
+    size_t cached_offset = 0;
+    for (auto& bucket : buckets) {
+        if constexpr (TrackChosen) {
+            bucket.entries.reserve(bucket.state_count);
+        } else {
+            bucket.entries.data = cached_storage.get() + cached_offset;
+            cached_offset += bucket.state_count;
+        }
     }
     for (auto item = table.begin(); item != table.end(); ++item) {
         const size_t bucket = connectivity_bucket[item->first.connectivity_id];
         const auto [base_hits, total_hits] =
             factor_hit_counts(item->first.hits, base_mask);
         const int flag_hits = total_hits - base_hits;
-        const DominanceKey key = dominance_key(item->second.cost, base_hits, total_hits);
+        const uint64_t key = dominance_primary_key(item->second.cost, base_hits);
         const int quasi_score = item->second.cost + base_hits - flag_hits;
         buckets[bucket].entries.push_back(
-            CachedItem{item, key, base_hits, flag_hits, quasi_score, false, false});
+            CachedItem{&*item, key, base_hits, flag_hits, quasi_score, false, false});
     }
     for (auto& bucket : buckets) {
         std::sort(bucket.entries.begin(), bucket.entries.end(),
                   [](const CachedItem& a, const CachedItem& b) {
-                      return a.key < b.key;
+                      return a.key_before(b);
                   });
     }
 
@@ -2835,7 +2866,7 @@ static size_t prune_dominated(FactorTable<FactorBits, TrackChosen>& table,
                 }
             }
             if (!population_matching_possible) continue;
-            if (survivors[coarse_id].front()->key > survivors[fine_id].back()->key) continue;
+            if (survivors[fine_id].back()->key_before(*survivors[coarse_id].front())) continue;
             if (minimum_quasi[coarse_id] > maximum_quasi[fine_id]) continue;
 
             bool relation;
@@ -2863,7 +2894,7 @@ static size_t prune_dominated(FactorTable<FactorBits, TrackChosen>& table,
             bool is_dominated = false;
             for (uint32_t coarse_id : coarser) {
                 for (CachedItem* prior : survivors[coarse_id]) {
-                    if (prior->key > cached->key) break;
+                    if (cached->key_before(*prior)) break;
                     if (dominates(prior, cached)) {
                         is_dominated = true;
                         break;
@@ -2923,8 +2954,8 @@ static size_t prune_dominated(FactorTable<FactorBits, TrackChosen>& table,
             // so adding the seed charge still cannot exceed B's primary key.
             // Use 64-bit arithmetic on the biased primary to avoid carry
             // between the two packed fields of DominanceKey.
-            const uint64_t minimum_primary = survivors[candidate_id].front()->key.first >> 32;
-            const uint64_t maximum_primary = live_targets.back()->key.first >> 32;
+            const uint64_t minimum_primary = survivors[candidate_id].front()->key >> 32;
+            const uint64_t maximum_primary = live_targets.back()->key >> 32;
             if (minimum_primary + static_cast<uint64_t>(extra_seeds) > maximum_primary)
                 continue;
             if (!connectivity_exact_quotient(connectivity_pool[target_id],
@@ -2946,12 +2977,12 @@ static size_t prune_dominated(FactorTable<FactorBits, TrackChosen>& table,
             auto eligible_end = candidates.begin();
             bool removed_target = false;
             for (CachedItem* target : live_targets) {
-                const uint64_t target_primary = target->key.first >> 32;
+                const uint64_t target_primary = target->key >> 32;
                 // Both lists have ascending primary keys. Advance the
                 // affordable prefix once across all targets for this pair
                 // of signatures, keeping the cutoff test out of the inner loop.
                 while (eligible_end != candidates.end() &&
-                       ((*eligible_end)->key.first >> 32) +
+                       ((*eligible_end)->key >> 32) +
                            static_cast<uint64_t>(extra_seeds) <= target_primary) {
                     ++eligible_end;
                 }
@@ -3487,6 +3518,8 @@ static Solution solve_frontier_core(const Model& original_model,
                                 penalty[1] = static_cast<int>((take.size() - skip.size()) / signature_words);
                         }
                     }
+                    for (auto& branch : computed)
+                        branch.hash_seed = hash_combine(0, branch.connectivity_id);
                     connectivity_cache[old_state.connectivity_id] = std::move(computed);
                     connectivity_ready[old_state.connectivity_id] = 1;
                 }
@@ -3606,11 +3639,16 @@ static Solution solve_frontier_core(const Model& original_model,
                             connectivity_id = next_connectivity_pool.intern(canonical);
                         }
                     }
+                    // Reuse the connectivity part of the state hash across
+                    // all factor states taking the same cached transition.
+                    const size_t hash_seed = connectivity_id == connection.connectivity_id
+                        ? connection.hash_seed : hash_combine(0, connectivity_id);
+                    const size_t state_hash = append_factor_hash(hash_seed, new_hits);
                     StateType state{connectivity_id, std::move(new_hits)};
                     Bits old_chosen{};
                     if constexpr (TrackChosen) old_chosen = old_record.chosen;
                     auto [found, inserted] = next.find_or_emplace(
-                        std::move(state), [&]() {
+                        std::move(state), state_hash, [&]() {
                         if constexpr (TrackChosen) {
                             Bits new_chosen = old_chosen;
                             if (selected) set_bit(new_chosen, i);
