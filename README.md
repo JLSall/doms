@@ -278,7 +278,7 @@ interpolation. Each run samples a different fixed board set; rerunning the
 command repeats the same three sets.
 
 Every board's PTTACG encoding, 3BV, and optimal click count must exactly match
-the committed references in `benchmarks/expert_benchmark_reference.h`. These
+the committed references in `benchmarks/expert_benchmark_reference.csv`. These
 references were generated with full replay and legal-action validation enabled.
 A mismatch stops immediately with exit status `2`, identifying the seed, board
 index, and expected/actual values. A run prints `PASS` only after all 1,000
@@ -548,6 +548,21 @@ stops comparing a target signature once its list is empty. Dominated states
 remain available as witnesses until all passes finish, preserving the same
 exact pruning decisions.
 
+The common connectivity-matching path builds eligibility one fine component
+at a time. If a fine component has no containing coarse component, it rejects
+the comparison immediately. Otherwise it uses the same eligibility graph and
+complete matching test, preserving every dominance decision.
+
+Survivor lists for all connectivity signatures share one contiguous pointer
+buffer per dominance pass. Each signature receives a disjoint slice sized by
+its incoming state count, which bounds its maximum possible survivors. This
+avoids a separate allocation for every signature while preserving witness
+order, stable pointers, and all dominance comparisons.
+
+Sorted component sizes also share one contiguous buffer, with prefix offsets
+assigning each live signature its own slice. This removes per-signature
+vector allocations while preserving every component-size filter result.
+
 **Dominance pruning has no comparison budget.** Every scheduled pass runs
 without a numerical comparison limit, retaining the safe filters and early
 exits above. Budget counters, exhaustion checks, and exhaustion reporting have
@@ -568,6 +583,10 @@ especially on rectangular Expert boards.
 Width estimation accumulates graph and factor interval endpoints in difference
 arrays, then sweeps the boundaries once. This avoids scanning every interval
 at every boundary while preserving exactly the same estimates and order choices.
+
+Smart line ordering combines current-line scopes into the before/after subset
+histograms, using two transforms instead of three for each crossing-cost
+calculation. Every crossing score and ordering tie break remains identical.
 
 Automatic ordering also tries bands whose widths change across the board. It
 computes the frontier profile for each contiguous band of one through eight
@@ -654,25 +673,7 @@ solver for discovering an unknown board without guessing.
 
 ## Development checks
 
-The benchmark regression checks option conflicts, interpolated percentiles, and
-rejection of changed board encodings, 3BV values, or click counts at every
-reference position:
-
-```console
-g++ -std=c++17 -O2 -pthread benchmarks/test_fixed_benchmark.cpp -o benchmark_test
-./benchmark_test
-```
-
 Run `./doms --benchmark` for the complete 3,000-board integration check.
-
-The C++ width-estimation regression compares 19,000 full and partial sweep
-estimates with the original interval-scanning implementation, including empty
-orders and saturated work estimates:
-
-```console
-g++ -std=c++17 -O2 -pthread tests/width_estimate.cpp -o width_estimate_test
-./width_estimate_test
-```
 
 Compile with warnings enabled:
 
