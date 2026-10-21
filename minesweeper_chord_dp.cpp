@@ -2719,6 +2719,15 @@ static size_t prune_dominated(FactorTable<FactorBits, TrackChosen>& table,
                     minimum_quasi[candidate_id] + extra_seeds > maximum_quasi[target_id]) {
                     continue;
                 }
+                // The high half of the key orders cost + active 3BV hits.
+                // The factor penalty is at least base_hits(A)-base_hits(B),
+                // so adding the seed charge still cannot exceed B's primary key.
+                // Use 64-bit arithmetic on the biased primary to avoid carry
+                // between the two packed fields of DominanceKey.
+                const uint64_t minimum_primary = survivors[candidate_id].front()->key.first >> 32;
+                const uint64_t maximum_primary = survivors[target_id].back()->key.first >> 32;
+                if (minimum_primary + static_cast<uint64_t>(extra_seeds) > maximum_primary)
+                    continue;
                 if (!connectivity_exact_quotient(connectivity_pool[target_id],
                                                  connectivity_pool[candidate_id],
                                                  signature_words)) {
@@ -2731,10 +2740,25 @@ static size_t prune_dominated(FactorTable<FactorBits, TrackChosen>& table,
                         minimum_quasi[candidate_id] + extra_seeds > maximum_quasi[target_id]) {
                         continue;
                     }
+                    if (minimum_primary + static_cast<uint64_t>(extra_seeds) > maximum_primary)
+                        continue;
                 }
+                const auto& candidates = survivors[candidate_id];
+                auto eligible_end = candidates.begin();
                 for (CachedItem* target : survivors[target_id]) {
                     if (target->cross_dominated) continue;
-                    for (CachedItem* candidate : survivors[candidate_id]) {
+                    const uint64_t target_primary = target->key.first >> 32;
+                    // Both lists have ascending primary keys. Advance the
+                    // affordable prefix once across all targets for this pair
+                    // of signatures, keeping the cutoff test out of the inner loop.
+                    while (eligible_end != candidates.end() &&
+                           ((*eligible_end)->key.first >> 32) +
+                               static_cast<uint64_t>(extra_seeds) <= target_primary) {
+                        ++eligible_end;
+                    }
+                    for (auto candidate_it = candidates.begin(); candidate_it != eligible_end;
+                         ++candidate_it) {
+                        CachedItem* candidate = *candidate_it;
                         if (candidate->item->second.cost + extra_seeds >
                             target->item->second.cost) continue;
                         if (candidate->quasi_score + extra_seeds > target->quasi_score)
