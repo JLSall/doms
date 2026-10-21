@@ -509,7 +509,10 @@ candidate if it is an unpaired tail. This gives both candidates' effects a
 chance to combine before the more expensive comparisons.
 
 Equivalent histories are merged. Connectivity signatures are interned per
-layer, and DP states are held in a dense open-addressed table. Once a layer's
+layer. Their words share one contiguous arena, with offsets, lengths, and
+hashes stored in a separate metadata array. This replaces per-signature word
+allocations and pointer indirection while retaining the same signature IDs.
+DP states are held in a dense open-addressed table. Once a layer's
 duplicate merging is complete, lookup indexes of at least 64 KiB are released:
 dominance removes
 states directly by dense-entry index, and the next transition iterates the

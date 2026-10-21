@@ -8,7 +8,6 @@
 #include <cctype>
 #include <cstdint>
 #include <cstdlib>
-#include <deque>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -1931,6 +1930,28 @@ static size_t hash_combine(size_t seed, uint64_t value) {
     return seed ^ (value + 0x9e3779b97f4a7c15ULL + (seed << 6) + (seed >> 2));
 }
 
+// Non-owning access to an interned signature. Views are temporary: never keep
+// one across a mutating operation on its pool, or beyond the pool's lifetime.
+class SignatureView {
+public:
+    SignatureView(const uint64_t* data, size_t count) : data_(data), size_(count) {}
+    SignatureView(const std::vector<uint64_t>& words)
+        : data_(words.empty() ? &empty_word : words.data()), size_(words.size()) {}
+    const uint64_t* begin() const { return data_; }
+    const uint64_t* end() const { return data_ + size_; }
+    size_t size() const { return size_; }
+    bool empty() const { return size_ == 0; }
+    uint64_t operator[](size_t index) const { return data_[index]; }
+    friend bool operator==(SignatureView a, SignatureView b) {
+        return a.size_ == b.size_ && std::equal(a.begin(), a.end(), b.begin());
+    }
+
+private:
+    inline static constexpr uint64_t empty_word = 0;
+    const uint64_t* data_;
+    size_t size_;
+};
+
 struct WordsHash {
     size_t operator()(const std::vector<uint64_t>& words) const {
         size_t hash = words.size();
@@ -1950,57 +1971,66 @@ public:
         const size_t hash = WordsHash{}(signature);
         size_t slot = hash & (slots_.size() - 1);
         while (slots_[slot] != empty_slot) {
-            const auto& entry = *by_id_[slots_[slot]];
-            if (entry.hash == hash && entry.signature == signature) return slots_[slot];
+            const auto& entry = entries_[slots_[slot]];
+            if (entry.hash == hash && entry.length == signature.size() &&
+                std::equal(signature.begin(), signature.end(), words_.begin() + entry.offset))
+                return slots_[slot];
             slot = (slot + 1) & (slots_.size() - 1);
         }
-        // Grow only for a new signature. Existing signatures keep their IDs,
-        // and deque insertion preserves references used by DP transitions.
-        if (by_id_.size() >= empty_slot)
+        // Store offsets rather than pointers so arena growth preserves IDs.
+        // The input is an external vector, never a view into this arena.
+        if (entries_.size() >= empty_slot)
             throw std::length_error("too many connectivity signatures");
-        if (by_id_.size() + 1 > slots_.size() / 2) {
-            rehash(capacity_for(by_id_.size() + 1));
+        if (entries_.size() + 1 > slots_.size() / 2) {
+            rehash(capacity_for(entries_.size() + 1));
             slot = hash & (slots_.size() - 1);
             while (slots_[slot] != empty_slot) slot = (slot + 1) & (slots_.size() - 1);
         }
-        const uint32_t id = static_cast<uint32_t>(by_id_.size());
-        entries_.push_back(Entry{signature, hash});
-        by_id_.push_back(&entries_.back());
+        const uint32_t id = static_cast<uint32_t>(entries_.size());
+        const size_t offset = words_.size();
+        words_.insert(words_.end(), signature.begin(), signature.end());
+        entries_.push_back(Entry{offset, signature.size(), hash});
         slots_[slot] = id;
         return id;
     }
 
-    const std::vector<uint64_t>& operator[](uint32_t id) const { return by_id_[id]->signature; }
-    size_t size() const { return by_id_.size(); }
+    SignatureView operator[](uint32_t id) const {
+        const auto& entry = entries_[id];
+        return SignatureView(words_.data() + entry.offset, entry.length);
+    }
+    size_t size() const { return entries_.size(); }
     void reserve(size_t count) {
         const size_t capacity = capacity_for(count);
         if (capacity > slots_.size()) rehash(capacity);
-        by_id_.reserve(count);
+        entries_.reserve(count);
     }
     void reset(size_t reserve_count = 0) {
-        by_id_.clear();
         entries_.clear();
-        by_id_.reserve(reserve_count);
+        entries_.reserve(reserve_count);
+        words_.clear();
+        // Keep empty-signature views non-null, including before the first
+        // nonempty signature is inserted.
+        words_.push_back(0);
         slots_.assign(capacity_for(reserve_count), empty_slot);
         intern(std::vector<uint64_t>{});
     }
     void swap(ConnectivityPool& other) noexcept {
         slots_.swap(other.slots_);
-        by_id_.swap(other.by_id_);
+        words_.swap(other.words_);
         entries_.swap(other.entries_);
     }
 
 private:
     struct Entry {
-        std::vector<uint64_t> signature;
+        size_t offset;
+        size_t length;
         size_t hash;
     };
     static constexpr uint32_t empty_slot = std::numeric_limits<uint32_t>::max();
-    // IDs, rather than pointers, keep the lookup array compact. Signatures
-    // stay in stable storage so interning cannot invalidate a caller's input.
+    // Contiguous metadata and word storage replace per-signature allocations.
     std::vector<uint32_t> slots_;
-    std::deque<Entry> entries_;
-    std::vector<const Entry*> by_id_;
+    std::vector<Entry> entries_;
+    std::vector<uint64_t> words_;
 
     static size_t capacity_for(size_t count) {
         size_t capacity = 16;
@@ -2013,8 +2043,8 @@ private:
     }
     void rehash(size_t capacity) {
         std::vector<uint32_t> slots(capacity, empty_slot);
-        for (uint32_t id = 0; id < by_id_.size(); ++id) {
-            size_t slot = by_id_[id]->hash & (capacity - 1);
+        for (uint32_t id = 0; id < entries_.size(); ++id) {
+            size_t slot = entries_[id].hash & (capacity - 1);
             while (slots[slot] != empty_slot) slot = (slot + 1) & (capacity - 1);
             slots[slot] = id;
         }
@@ -2345,8 +2375,8 @@ static DominanceKey dominance_key(int cost, int base_hits, int total_hits) {
 // every finer component's future reachability is contained in its representative.
 // Requiring every coarse component to represent at least one fine component
 // prevents an unmatched component from adding a future seed-click liability.
-static bool connectivity_coarsens(const std::vector<uint64_t>& coarse,
-                                  const std::vector<uint64_t>& fine,
+static bool connectivity_coarsens(SignatureView coarse,
+                                  SignatureView fine,
                                   size_t signature_words) {
     const size_t coarse_count = coarse.size() / signature_words;
     const size_t fine_count = fine.size() / signature_words;
@@ -2454,8 +2484,8 @@ static bool connectivity_coarsens(const std::vector<uint64_t>& coarse,
 // of its assigned fine reaches. Merely being contained is insufficient: extra
 // coarse reach can join two future components without a corresponding join on
 // the fine side, exceeding the simple seed-count bound.
-static bool connectivity_exact_quotient(const std::vector<uint64_t>& coarse,
-                                        const std::vector<uint64_t>& fine,
+static bool connectivity_exact_quotient(SignatureView coarse,
+                                        SignatureView fine,
                                         size_t signature_words) {
     const size_t coarse_count = coarse.size() / signature_words;
     const size_t fine_count = fine.size() / signature_words;
@@ -2507,8 +2537,8 @@ static bool connectivity_exact_quotient(const std::vector<uint64_t>& coarse,
 // along their bipartite overlap graph to obtain a common coarsening J.
 // A needs at most count(A)-count(J) more future seeds than B: merging that
 // many components takes A to J, and J can only improve on B.
-static int connectivity_merge_penalty(const std::vector<uint64_t>& a,
-                                      const std::vector<uint64_t>& b,
+static int connectivity_merge_penalty(SignatureView a,
+                                      SignatureView b,
                                       size_t words) {
     const int na = static_cast<int>(a.size() / words);
     const int nb = static_cast<int>(b.size() / words);
