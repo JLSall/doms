@@ -102,6 +102,8 @@ struct ProfileStats {
     double dominance_setup = 0.0;
     double dominance_exact = 0.0;
     double dominance_cross = 0.0;
+    double dominance_forward = 0.0;
+    double dominance_reverse = 0.0;
     double dominance_erase = 0.0;
     uint64_t processed_states = 0;
     uint64_t generated_states = 0;
@@ -2283,6 +2285,23 @@ static bool connectivity_exact_quotient(const std::vector<uint64_t>& coarse,
     const size_t fine_count = fine.size() / signature_words;
     if (coarse_count == 0 || coarse_count >= fine_count) return false;
     if (coarse_count == 1) return true; // The enclosing union buckets agree.
+    if (signature_words == 1 && coarse_count <= 64) {
+        std::array<uint64_t, 64> recovered{};
+        for (uint64_t component : fine) {
+            size_t parent = coarse_count;
+            for (size_t c = 0; c < coarse_count; ++c) {
+                if ((component & ~coarse[c]) != 0) continue;
+                if (parent != coarse_count) return false;
+                parent = c;
+            }
+            if (parent == coarse_count) return false;
+            recovered[parent] |= component;
+        }
+        for (size_t c = 0; c < coarse_count; ++c) {
+            if (recovered[c] != coarse[c]) return false;
+        }
+        return true;
+    }
     std::vector<uint64_t> recovered(coarse.size(), 0);
     for (size_t f = 0; f < fine_count; ++f) {
         size_t parent = coarse_count;
@@ -2586,6 +2605,7 @@ static size_t prune_dominated(FactorTable<FactorBits, TrackChosen>& table,
         }
     }
 
+    const auto forward_end = profile ? std::chrono::steady_clock::now() : exact_end;
 
     // Reverse connectivity dominance: a cheaper finer state can dominate a
     // coarser state even if their future chords never reunite its pieces. The
@@ -2656,6 +2676,8 @@ static size_t prune_dominated(FactorTable<FactorBits, TrackChosen>& table,
         profile->dominance_setup += std::chrono::duration<double>(setup_end - profile_start).count();
         profile->dominance_exact += std::chrono::duration<double>(exact_end - setup_end).count();
         profile->dominance_cross += std::chrono::duration<double>(cross_end - exact_end).count();
+        profile->dominance_forward += std::chrono::duration<double>(forward_end - exact_end).count();
+        profile->dominance_reverse += std::chrono::duration<double>(cross_end - forward_end).count();
         profile->dominance_erase += std::chrono::duration<double>(erase_end - cross_end).count();
     }
     return removed;
@@ -3862,7 +3884,9 @@ int main(int argc, char** argv) {
                       << "Profile: dominance detail: setup " << p.dominance_setup
                       << " s; same-connectivity " << p.dominance_exact
                       << " s; cross-connectivity " << p.dominance_cross
-                      << " s; erasure " << p.dominance_erase
+                      << " s (forward " << p.dominance_forward
+                      << " s, reverse " << p.dominance_reverse << " s)"
+                      << "; erasure " << p.dominance_erase
                       << " s; cleanup/other " << std::max(0.0, p.dominance -
                           p.dominance_setup - p.dominance_exact -
                           p.dominance_cross - p.dominance_erase) << " s\n"
