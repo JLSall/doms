@@ -222,16 +222,19 @@ many boards:
 ./doms --bulk expert 10 > expert-results.csv
 ```
 
-The CSV contains exactly these columns:
+The CSV contains these columns:
 
 ```csv
-board,3bv,optimal_clicks
-"b=1&m=080212g040002k00g",16,12
+board,3bv,optimal_clicks,solve_seconds
+"b=1&m=080212g040002k00g",16,12,0.004321
 ```
 
 `board` is the bare PTTACG string. The CSV is written to standard output; the
 RNG seed, progress, and total elapsed time are written to standard error, so
 redirecting standard output produces a clean CSV file.
+Each row's `solve_seconds` covers model construction and solving that board.
+After the run, standard error reports the median, p5, and p95 per-board solve
+times. Percentiles use linear interpolation between neighboring sorted values.
 
 Bulk generation uses `std::mt19937_64` and unbiased rejection sampling. Supply
 `--seed` to reproduce the complete sequence:
@@ -250,10 +253,42 @@ produces the same boards and CSV row order at every thread count.
 
 For a single board, replay remains the default. Use `--count-only` to print
 only the optimal click count and DP statistics. `--no-count-only` enables
-reconstruction and validation during bulk runs too, but the CSV still contains
-only the three columns above. Count-only JSON omits move and breakdown fields.
+reconstruction and validation during bulk runs too. Count-only JSON omits move
+and breakdown fields.
 `--click-tuples` requires replay. Each worker solves one board at a time; use
 fewer threads if simultaneous difficult boards consume too much memory.
+
+### Fixed single-thread benchmark
+
+```console
+./doms --benchmark
+```
+
+This always runs three sets of 1,000 Expert boards (30 x 16, 99 mines),
+sequentially on one thread in count-only mode, using these seeds in order:
+
+1. `15415727658250109428`
+2. `13781498123793209364`
+3. `1443274517951773430`
+
+Each run prints total elapsed seconds and median, p5, and p95 per-board solve
+seconds. Total time includes generation, solving, and reference validation;
+per-board times cover model construction and solving. Percentiles use linear
+interpolation. Each run samples a different fixed board set; rerunning the
+command repeats the same three sets.
+
+Every board's PTTACG encoding, 3BV, and optimal click count must exactly match
+the committed references in `benchmarks/expert_benchmark_reference.h`. These
+references were generated with full replay and legal-action validation enabled.
+A mismatch stops immediately with exit status `2`, identifying the seed, board
+index, and expected/actual values. A run prints `PASS` only after all 1,000
+boards match; timing values are allowed to vary. References are never updated
+by the benchmark.
+
+`--progress`, `--order`, and `--band-size` are supported; all order choices must
+produce the same counts. `--count-only` is accepted explicitly. Other input
+modes, `--seed`, `--threads`, `--no-count-only`, `--profile`, `--json`, and
+`--click-tuples` cannot be combined with `--benchmark`.
 
 ## Output formats and coordinates
 
@@ -328,8 +363,9 @@ World of Minesweeper game URL, MBF filename, or quoted MBF hexadecimal.
 
 | Option | Meaning |
 | --- | --- |
+| `--benchmark` | Run three fixed sets of 1,000 Expert boards on one thread, validate every board and count against committed references, and report total/median/p5/p95 seconds for each run. |
 | `--generate beginner\|intermediate\|expert` | Generate, print, and solve one random standard board. Do not also supply `BOARD`. |
-| `--bulk beginner\|intermediate\|expert COUNT` | Generate and optimally solve `COUNT` boards, writing `board,3bv,optimal_clicks` CSV to standard output. |
+| `--bulk beginner\|intermediate\|expert COUNT` | Generate and optimally solve `COUNT` boards, writing per-board solve times in the CSV and median, p5, and p95 solve times to standard error. |
 | `--seed N` | Reproduce a generated board or complete bulk sequence. Requires `--generate` or `--bulk`. |
 | `--threads N` | Set the number of bulk solver threads; default uses `hardware_concurrency()`, with a fallback of one. Requires `--bulk`. |
 | `--count-only` | Store only state costs and omit move reconstruction; default for bulk runs. |
@@ -456,7 +492,13 @@ candidate if it is an unpaired tail. This gives both candidates' effects a
 chance to combine before the more expensive comparisons.
 
 Equivalent histories are merged. Connectivity signatures are interned per
-layer, and DP states are held in a dense open-addressed table. Mine/3BV factors
+layer, and DP states are held in a dense open-addressed table. Once a layer's
+duplicate merging is complete, lookup indexes of at least 64 KiB are released:
+dominance removes
+states directly by dense-entry index, and the next transition iterates the
+survivors. This avoids hashing deleted states and reduces memory held during
+dominance pruning. Smaller layers keep their index for allocator reuse.
+Mine/3BV factors
 receive reusable slots for only the portion of the sweep in which they are
 live. When at most 64 slots are required, the complete factor state is stored
 and processed as one `uint64_t`; wider custom boards use a dynamically sized
@@ -465,6 +507,8 @@ boundary slots. Standard boards therefore store each unfinished component in
 one or two 64-bit words rather than a bitset spanning every chord candidate;
 boundaries requiring more than 128 slots use the general representation.
 Connectivity transitions are cached per signature within each candidate step.
+For one-word components, transitions sort the component words directly to
+canonicalize the signature, avoiding an offset sort and a separate copy.
 Count-only mode uses a separate template specialization that omits the chosen
 chord history from every state and skips move reconstruction and validation.
 
@@ -472,6 +516,8 @@ DOMS also applies **opening-chain absorption**, an exact state equivalence. If
 an unfinished chord component can reach exactly the undecided border of one
 zero opening, and that opening is already covered, the state is normalized by
 removing the component, marking the opening uncovered, and adding one click.
+One-word component signatures are sorted, so matching opening borders use
+binary search; wider signatures keep the full component comparison.
 If no later border chord is selected, this pays the component's eventual seed
 click; if one is selected, its new seed click and newly saved 3BV click cancel.
 The normalized state therefore has exactly the same cost under every future
@@ -496,7 +542,11 @@ reachability, cached factor counts, and sorted cost keys. Safe cost and
 component-size filters reject impossible comparisons before the full
 connectivity tests. Sorted cost cutoffs stop scans once later witnesses cannot
 afford to dominate the target; the compensated pass skips targets already
-removed by coarsening dominance.
+removed by coarsening dominance. During that pass it keeps a compact list of
+remaining targets, refreshes the cost bounds when targets are removed, and
+stops comparing a target signature once its list is empty. Dominated states
+remain available as witnesses until all passes finish, preserving the same
+exact pruning decisions.
 
 **Dominance pruning has no comparison budget.** Every scheduled pass runs
 without a numerical comparison limit, retaining the safe filters and early
@@ -514,6 +564,10 @@ This gives extra weight to connectivity because component relationships are
 more expensive than independent factor bits. Ordering is a performance
 heuristic, not a guarantee of the fastest possible solve. Direction matters
 especially on rectangular Expert boards.
+
+Width estimation accumulates graph and factor interval endpoints in difference
+arrays, then sweeps the boundaries once. This avoids scanning every interval
+at every boundary while preserving exactly the same estimates and order choices.
 
 Automatic ordering also tries bands whose widths change across the board. It
 computes the frontier profile for each contiguous band of one through eight
@@ -599,6 +653,26 @@ be placed before their neighboring numbered squares are opened. It is not a
 solver for discovering an unknown board without guessing.
 
 ## Development checks
+
+The benchmark regression checks option conflicts, interpolated percentiles, and
+rejection of changed board encodings, 3BV values, or click counts at every
+reference position:
+
+```console
+g++ -std=c++17 -O2 -pthread benchmarks/test_fixed_benchmark.cpp -o benchmark_test
+./benchmark_test
+```
+
+Run `./doms --benchmark` for the complete 3,000-board integration check.
+
+The C++ width-estimation regression compares 19,000 full and partial sweep
+estimates with the original interval-scanning implementation, including empty
+orders and saturated work estimates:
+
+```console
+g++ -std=c++17 -O2 -pthread tests/width_estimate.cpp -o width_estimate_test
+./width_estimate_test
+```
 
 Compile with warnings enabled:
 
