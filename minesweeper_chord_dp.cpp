@@ -1016,13 +1016,23 @@ static CandidateReduction reduce_candidates(const Model& original, bool progress
         std::vector<uint8_t> keep(q, 1);
         int swaps_removed = 0;
         for (int victim = 0; victim < q; ++victim) {
-            for (int replacement = 0; replacement < q; ++replacement) {
-                if (keep[replacement] &&
-                    swap_dominated_candidate(relations, victim, replacement)) {
-                    keep[victim] = 0;
-                    ++swaps_removed;
-                    break;
+            // Only propagation neighbors can replace the victim. Enumerate
+            // their bits in ascending candidate order to preserve the first
+            // valid replacement and the batch's sequential deletion choices.
+            for (size_t word = 0; word < relations.propagation[victim].size(); ++word) {
+                uint64_t neighbors = relations.propagation[victim][word];
+                while (neighbors) {
+                    const int replacement = static_cast<int>(
+                        word * 64 + __builtin_ctzll(neighbors));
+                    neighbors &= neighbors - 1;
+                    if (keep[replacement] &&
+                        swap_dominated_candidate(relations, victim, replacement)) {
+                        keep[victim] = 0;
+                        ++swaps_removed;
+                        break;
+                    }
                 }
+                if (!keep[victim]) break;
             }
         }
         if (swaps_removed) {
@@ -2561,22 +2571,38 @@ static size_t prune_dominated(FactorTable<FactorBits, TrackChosen>& table,
     // and coarsening dominance can then reuse one cached key and one sort per
     // union bucket instead of rebuilding and sorting the table twice.
     std::unordered_map<std::vector<uint64_t>, size_t, WordsHash> bucket_by_union;
-    bucket_by_union.reserve(connectivity_count);
+    std::unordered_map<uint64_t, size_t> bucket_by_word;
+    if (signature_words == 1) bucket_by_word.reserve(connectivity_count);
+    else bucket_by_union.reserve(connectivity_count);
     std::vector<Bucket> buckets;
     std::vector<size_t> connectivity_bucket(connectivity_count,
                                              std::numeric_limits<size_t>::max());
     for (uint32_t id = 0; id < connectivity_count; ++id) {
         if (state_counts[id] == 0) continue;
-        std::vector<uint64_t> combined(signature_words, 0);
         const auto& signature = connectivity_pool[id];
-        for (size_t offset = 0; offset < signature.size(); offset += signature_words) {
-            for (size_t word = 0; word < signature_words; ++word) {
-                combined[word] |= signature[offset + word];
+        size_t bucket;
+        bool new_bucket;
+        if (signature_words == 1) {
+            // A scalar key represents the same union without allocating a
+            // one-element vector for each signature. Assign bucket IDs in
+            // signature order, just as on the multiword path.
+            uint64_t combined = 0;
+            for (uint64_t component : signature) combined |= component;
+            const auto result = bucket_by_word.emplace(combined, buckets.size());
+            bucket = result.first->second;
+            new_bucket = result.second;
+        } else {
+            std::vector<uint64_t> combined(signature_words, 0);
+            for (size_t offset = 0; offset < signature.size(); offset += signature_words) {
+                for (size_t word = 0; word < signature_words; ++word) {
+                    combined[word] |= signature[offset + word];
+                }
             }
+            const auto result = bucket_by_union.emplace(std::move(combined), buckets.size());
+            bucket = result.first->second;
+            new_bucket = result.second;
         }
-        auto [where, inserted] = bucket_by_union.emplace(std::move(combined), buckets.size());
-        if (inserted) buckets.emplace_back();
-        const size_t bucket = where->second;
+        if (new_bucket) buckets.emplace_back();
         connectivity_bucket[id] = bucket;
         buckets[bucket].connectivity_ids.push_back(id);
     }
@@ -4046,6 +4072,7 @@ static void print_click_tuples(const Model& model, const Solution& solution) {
 
 struct Options {
     bool benchmark = false;
+    bool benchmark_multi = false;
     std::optional<std::string> board;
     std::optional<std::string> generate;
     std::optional<std::string> bulk;
@@ -4069,6 +4096,7 @@ static void print_help(const char* program) {
         << "World of Minesweeper game URL, MBF filename, or quoted MBF hex.\n\n"
         << "Options:\n"
         << "  --benchmark                    Three fixed 1000-board Expert runs, one thread; validate counts\n"
+        << "  --benchmark-multi              Same fixed benchmark using multiple threads\n"
         << "  --generate beginner|intermediate|expert\n"
         << "                                 Generate, print, and solve one random board\n"
         << "  --bulk beginner|intermediate|expert COUNT\n"
@@ -4126,6 +4154,10 @@ static Options parse_options(int argc, char** argv) {
             print_help(argv[0]);
             std::exit(0);
         } else if (arg == "--benchmark") options.benchmark = true;
+        else if (arg == "--benchmark-multi") {
+            options.benchmark = true;
+            options.benchmark_multi = true;
+        }
         else if (arg == "--generate") options.generate = value_after(i, arg);
         else if (arg == "--bulk") {
             options.bulk = value_after(i, arg);
@@ -4151,10 +4183,10 @@ static Options parse_options(int argc, char** argv) {
     };
     if (options.benchmark) {
         if (options.board || options.generate || options.bulk || options.seed ||
-            options.threads || options.json || options.click_tuples || options.profile ||
+            (options.threads && !options.benchmark_multi) || options.json || options.click_tuples || options.profile ||
             (options.count_only && !*options.count_only)) {
-            throw UserError("--benchmark uses fixed seeds, Expert boards, one thread, and count-only output; "
-                            "cannot combine with BOARD, --generate, --bulk, --seed, --threads, "
+            throw UserError("benchmark modes use fixed seeds, Expert boards, and count-only output; "
+                            "cannot combine with BOARD, --generate, --bulk, --seed, incompatible --threads, "
                             "--json, --click-tuples, --profile, or --no-count-only");
         }
     }
@@ -4185,7 +4217,8 @@ static Options parse_options(int argc, char** argv) {
         throw UserError("--band-size requires a plain row or column --order (or auto)");
     }
     if (options.json && options.click_tuples) throw UserError("choose only one of --json and --click-tuples");
-    if (options.threads && !options.bulk) throw UserError("--threads requires --bulk");
+    if (options.threads && !options.bulk && !options.benchmark_multi)
+        throw UserError("--threads requires --bulk or --benchmark-multi");
     if (options.click_tuples && options.count_only.value_or(false)) {
         throw UserError("--click-tuples requires --no-count-only");
     }
@@ -4273,6 +4306,81 @@ static void validate_benchmark_result(size_t run, size_t index, const std::strin
 
 static void run_benchmark(const Options& options) {
     const auto references = load_benchmark_references();
+    if (options.benchmark_multi) {
+        const unsigned detected = std::thread::hardware_concurrency();
+        const size_t workers = std::min(expert_benchmark::board_count,
+            options.threads.value_or(detected ? detected : 1));
+        std::cout << "Expert benchmark: 3 runs x 1000 boards; " << workers
+                  << " worker thread(s); count-only\n"
+                  << "Per-board times include model construction and solving; "
+                     "percentiles use linear interpolation.\n"
+                  << "run,seed,boards,threads,total_seconds,median_seconds,p5_seconds,p95_seconds,validation\n";
+        for (size_t run = 0; run < expert_benchmark::seeds.size(); ++run) {
+            struct Job {
+                Board board;
+                std::string encoded;
+                double seconds = 0.0;
+                std::string error;
+            };
+            const auto start = std::chrono::steady_clock::now();
+            std::mt19937_64 rng(expert_benchmark::seeds[run]);
+            std::vector<Job> jobs(expert_benchmark::board_count);
+            for (auto& job : jobs) {
+                job.board = generate_standard_board("expert", rng);
+                job.encoded = format_pttacg_string(job.board);
+            }
+            std::atomic<size_t> next{0};
+            auto work = [&] {
+                for (;;) {
+                    const size_t index = next.fetch_add(1, std::memory_order_relaxed);
+                    if (index >= jobs.size()) break;
+                    auto& job = jobs[index];
+                    try {
+                        const auto solve_start = std::chrono::steady_clock::now();
+                        Model model = build_model(job.board);
+                        Solution solution = solve_frontier(
+                            model, options.order, options.band_size, false, true);
+                        const auto solve_end = std::chrono::steady_clock::now();
+                        validate_benchmark_result(run, index, job.encoded, model.three_bv(),
+                                                  solution.clicks, references);
+                        job.seconds = std::chrono::duration<double>(solve_end - solve_start).count();
+                    } catch (const std::exception& error) {
+                        job.error = error.what();
+                    }
+                }
+            };
+            if (workers == 1) work();
+            else {
+                std::vector<std::thread> pool;
+                pool.reserve(workers);
+                for (size_t t = 0; t < workers; ++t) pool.emplace_back(work);
+                for (auto& thread : pool) thread.join();
+            }
+            std::vector<double> solve_times;
+            solve_times.reserve(jobs.size());
+            for (size_t index = 0; index < jobs.size(); ++index) {
+                if (!jobs[index].error.empty())
+                    throw UserError("benchmark run " + std::to_string(run + 1) + ", board " +
+                                    std::to_string(index + 1) + " failed: " + jobs[index].error);
+                solve_times.push_back(jobs[index].seconds);
+                if (options.progress && ((index + 1) % 100 == 0))
+                    std::cerr << "Benchmark run " << run + 1 << "/3, seed "
+                              << expert_benchmark::seeds[run] << ": " << index + 1
+                              << "/1000 boards validated\n";
+            }
+            const double total = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - start).count();
+            std::sort(solve_times.begin(), solve_times.end());
+            std::cout << run + 1 << ',' << expert_benchmark::seeds[run] << ','
+                      << solve_times.size() << ',' << workers << ','
+                      << std::fixed << std::setprecision(6) << total << ','
+                      << benchmark_percentile(solve_times, 0.50) << ','
+                      << benchmark_percentile(solve_times, 0.05) << ','
+                      << benchmark_percentile(solve_times, 0.95) << ",PASS\n" << std::flush;
+        }
+        std::cout << "Validated all 3000 boards against fixed board, 3BV, and optimal-click references.\n";
+        return;
+    }
     std::cout << "Expert benchmark: 3 runs x 1000 boards; single thread; count-only\n"
               << "Per-board times include model construction and solving; "
                  "percentiles use linear interpolation.\n"

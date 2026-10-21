@@ -290,6 +290,22 @@ produce the same counts. `--count-only` is accepted explicitly. Other input
 modes, `--seed`, `--threads`, `--no-count-only`, `--profile`, `--json`, and
 `--click-tuples` cannot be combined with `--benchmark`.
 
+### Fixed multithread benchmark
+
+```console
+./doms --benchmark-multi
+```
+
+This runs the same three fixed sets of 1,000 Expert boards and validates every
+board against the same committed references, using one worker per available
+hardware thread (falling back to one). Set the worker count explicitly with
+`--threads N`, for example `./doms --benchmark-multi --threads 4`. Board
+generation is deterministic and happens before parallel solving, so every
+worker count receives the same boards. Total times include board generation
+and validation; per-board times cover model construction and solving. Parallel
+timings are affected by CPU and memory contention, and concurrent boards can
+use substantially more memory than the single-thread benchmark.
+
 ## Output formats and coordinates
 
 All output coordinates are 1-based.
@@ -364,6 +380,7 @@ World of Minesweeper game URL, MBF filename, or quoted MBF hexadecimal.
 | Option | Meaning |
 | --- | --- |
 | `--benchmark` | Run three fixed sets of 1,000 Expert boards on one thread, validate every board and count against committed references, and report total/median/p5/p95 seconds for each run. |
+| `--benchmark-multi` | Run the same fixed benchmark using available CPU threads; accepts `--threads N` to set the worker count. |
 | `--generate beginner\|intermediate\|expert` | Generate, print, and solve one random standard board. Do not also supply `BOARD`. |
 | `--bulk beginner\|intermediate\|expert COUNT` | Generate and optimally solve `COUNT` boards, writing per-board solve times in the CSV and median, p5, and p95 solve times to standard error. |
 | `--seed N` | Reproduce a generated board or complete bulk sequence. Requires `--generate` or `--bulk`. |

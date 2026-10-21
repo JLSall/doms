@@ -977,3 +977,119 @@ outputs, raw results, and benchmark logs are outside version control under
 The measured changed executable was installed as `doms.exe`, checked by SHA-256,
 and passed an Expert replay smoke check. Its previous version is archived as
 `original-doms.exe`. `git diff --check` passed.
+
+## Candidate reduction: enumerate eligible replacement neighbors
+
+Swap reduction previously scanned every candidate as a possible replacement,
+then immediately rejected non-neighbors. Enumerate the victim's propagation
+bitset instead, visiting words and set bits in ascending candidate order.
+This preserves every eligible comparison, its order, the first replacement,
+and all sequential deletion choices. The certificate, exact objective, DP,
+and search limits are unchanged. The enumeration overhead per victim changes
+from O(q) to O(ceil(q / 64) + degree); certificate checks are unchanged.
+
+An earlier experiment assigning free anchors before augmenting-path matching
+was discarded because full benchmarks did not establish a clear overall gain.
+That experiment is absent from the retained source.
+
+### Validation
+
+- Baseline and changed builds used MSYS2 UCRT64 GCC with identical
+  `-std=c++17 -O3 -DNDEBUG -pthread` flags. The changed build also passed
+  `-Wall -Wextra -Wpedantic` without diagnostics.
+- An assertion-enabled temporary differential harness compared the actual old
+  and new reduction functions on 3,000 deterministic boards, 1,000 per standard
+  difficulty. Every reduced model field and both deletion counts matched.
+- All non-timing JSON fields matched in 36 full-solver comparisons across
+  three difficulties, six seeds, and count-only/replay modes. All 18 replays
+  passed built-in legal-action simulation.
+- Four sequential `--benchmark` runs in baseline/changed/changed/baseline
+  order passed all fixed board, 3BV, and optimal-click references: 12,000
+  solves across the same 3,000 distinct Expert boards. No compilation or
+  other solver jobs from this session overlapped these four timing runs.
+- `git diff --check` passed. `doms.exe` is the measured changed build.
+
+### Measurements
+
+Each cell is total seconds for a fixed 1,000-board Expert set on one thread:
+
+| Fixed set | Baseline 1 | Changed 1 | Changed 2 | Baseline 2 |
+| --- | ---: | ---: | ---: | ---: |
+| 1 | 19.080375 | 18.156901 | 18.080949 | 18.818463 |
+| 2 | 18.431692 | 17.792469 | 17.389081 | 18.673921 |
+| 3 | 17.537436 | 17.012640 | 16.979660 | 17.611917 |
+| Total | 55.049503 | 52.962010 | 52.449690 | 55.104301 |
+
+Mean total runtime decreased from **55.076902 s to 52.705850 s (4.3%)**.
+Both changed runs and all corresponding set totals improved. These are local
+measurements from two repetitions on one machine; gains remain workload-
+dependent and memory use was not measured.
+
+Baseline source and executable, discarded matching experiment, differential
+harnesses, comparison scripts, and raw logs/results are outside version
+control under `C:\Users\happy\AppData\Local\Temp\doms-matching-20261021`.
+The retained experiment's logs have the `neighbor-` prefix.
+
+## Dominance setup: scalar keys for one-word connectivity unions
+
+### Plan and implementation
+
+Dominance groups connectivity signatures by their total future reachability.
+For one-word signatures, the previous code allocated a one-element vector
+for every live signature and used vector keys in its union hash map. Use a
+`uint64_t` union and scalar-key map for this case, avoiding those temporary
+allocations and the vector stored in each map entry. Keep the existing vector
+key path for multiword signatures.
+
+Scalar equality is exactly one-element-vector equality. Both paths assign
+bucket IDs on first occurrence while scanning signature IDs in ascending order;
+neither iterates the union map. Thus bucket IDs, entry order, sorting, witness
+order, pruning certificates, and retained states are unchanged. This introduces
+no heuristic or search limit. The baseline includes and preserves the existing
+working-tree candidate-neighbor enumeration optimization.
+
+### Validation
+
+- Both executables used MSYS2 UCRT64 GCC 16.1.0 and identical
+  `-std=c++17 -O3 -DNDEBUG -pthread` optimization flags. The changed build
+  additionally enabled `-Wall -Wextra -Wpedantic` and emitted no diagnostics.
+- All non-timing JSON fields and profile state/pruning counters matched in
+  36 baseline/changed comparisons across three standard difficulties, seeds
+  1, 42, 100, 2026, 123456, and 8675309, and count-only/replay modes. All 18
+  replay cases passed built-in legal-action simulation.
+- An assertion-enabled temporary harness compared the actual baseline and
+  changed pruning functions on 2,400 seeded randomized tables. All four
+  compact/wide-mask and count-only/replay specializations were exercised with
+  one through three connectivity words. Cases included common-union buckets
+  large enough to exercise pair postings, overlapping component reaches, empty
+  signatures, and seven-word factor masks and chosen histories. Survivor order,
+  states, costs, histories, and all three pruning counters matched exactly.
+- Four sequential full `--benchmark` invocations validated 12,000 solves over
+  the same 3,000 distinct Expert boards against unchanged board, 3BV, and
+  optimal-click references. Every invocation passed.
+- `git diff --check` passed. The measured changed build is installed as
+  `doms.exe`.
+
+### Measurements
+
+Measured runs were sequential in baseline/changed/changed/baseline order,
+without overlapping compilation or other solver jobs from this session.
+Preliminary and interrupted runs were excluded. Each cell below is total
+seconds for one fixed 1,000-board Expert set on one thread:
+
+| Fixed set | Baseline 1 | Changed 1 | Changed 2 | Baseline 2 |
+| --- | ---: | ---: | ---: | ---: |
+| 1 | 18.450707 | 17.729635 | 17.373478 | 19.069482 |
+| 2 | 17.775356 | 16.898258 | 17.047473 | 18.734084 |
+| 3 | 16.879637 | 16.212125 | 17.062855 | 17.321418 |
+| Total | 53.105700 | 50.840018 | 51.483806 | 55.124984 |
+
+Mean total runtime decreased from **54.115342 s to 51.161912 s (5.5%)**.
+Both changed totals were below both baseline totals. These are local results
+from two repetitions per build; machine activity affects timing, and gains
+remain workload-dependent. Memory use was not measured.
+
+Baseline source, original executable, measured builds, temporary harness and
+validation scripts, comparison outputs, and raw logs/results are outside
+version control in
+`C:\Users\happy\AppData\Local\Temp\doms-scalar-union-20261021`.
