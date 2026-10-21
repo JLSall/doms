@@ -2380,6 +2380,37 @@ static bool connectivity_exact_quotient(const std::vector<uint64_t>& coarse,
     return recovered == coarse;
 }
 
+// Both signatures have the same union of future reaches. Merge components
+// along their bipartite overlap graph to obtain a common coarsening J.
+// A needs at most count(A)-count(J) more future seeds than B: merging that
+// many components takes A to J, and J can only improve on B.
+static int connectivity_merge_penalty(const std::vector<uint64_t>& a,
+                                      const std::vector<uint64_t>& b,
+                                      size_t words) {
+    const int na = static_cast<int>(a.size() / words);
+    const int nb = static_cast<int>(b.size() / words);
+    if (na + nb > 128) return std::numeric_limits<int>::max();
+    std::array<int, 128> parent;
+    std::iota(parent.begin(), parent.begin() + na + nb, 0);
+    auto root = [&](int v) {
+        while (parent[v] != v) { parent[v] = parent[parent[v]]; v = parent[v]; }
+        return v;
+    };
+    int groups = na + nb;
+    for (int x = 0; x < na; ++x) {
+        for (int y = 0; y < nb; ++y) {
+            bool overlap = false;
+            for (size_t w = 0; w < words; ++w) {
+                if (a[x * words + w] & b[y * words + w]) { overlap = true; break; }
+            }
+            if (!overlap) continue;
+            const int rx = root(x), ry = root(na + y);
+            if (rx != ry) { parent[rx] = ry; --groups; }
+        }
+    }
+    return na - groups;
+}
+
 template <typename FactorBits, bool TrackChosen>
 static size_t prune_dominated(FactorTable<FactorBits, TrackChosen>& table,
                               uint64_t comparison_limit,
@@ -2667,33 +2698,43 @@ static size_t prune_dominated(FactorTable<FactorBits, TrackChosen>& table,
 
     const auto forward_end = profile ? std::chrono::steady_clock::now() : exact_end;
 
-    // Reverse connectivity dominance: a cheaper finer state can dominate a
-    // coarser state even if their future chords never reunite its pieces. The
-    // maximum extra seed cost is the difference in live component counts.
+    // Cost-compensated connectivity dominance extends the reverse pass.
+    // Exact quotients pay the difference in live component counts. Otherwise,
+    // a common merge bounds the extra seeds even for incomparable signatures.
     // Run this after the usual pass so its comparisons cannot displace the
     // established coarsening checks within the layer's comparison budget.
     if (!exhausted) {
-        for (uint32_t coarse_id = 0; coarse_id < connectivity_count && !exhausted;
-             ++coarse_id) {
-            if (survivors[coarse_id].empty()) continue;
-            const auto& bucket = buckets[connectivity_bucket[coarse_id]];
-            for (uint32_t fine_id : bucket.connectivity_ids) {
-                if (component_counts[fine_id] <= component_counts[coarse_id] ||
-                    survivors[fine_id].empty()) continue;
-                const int extra_seeds = static_cast<int>(
-                    component_counts[fine_id] - component_counts[coarse_id]);
-                if (minimum_cost[fine_id] + extra_seeds > maximum_cost[coarse_id] ||
-                    minimum_quasi[fine_id] + extra_seeds > maximum_quasi[coarse_id]) {
+        for (uint32_t target_id = 0; target_id < connectivity_count && !exhausted;
+             ++target_id) {
+            if (survivors[target_id].empty()) continue;
+            const auto& bucket = buckets[connectivity_bucket[target_id]];
+            for (uint32_t candidate_id : bucket.connectivity_ids) {
+                if (candidate_id == target_id || survivors[candidate_id].empty()) continue;
+                // A positive compensation requires a strictly cheaper witness.
+                // This also prevents cycles of mutually deleted new witnesses.
+                int extra_seeds = std::max(1,
+                    static_cast<int>(component_counts[candidate_id]) -
+                    static_cast<int>(component_counts[target_id]));
+                if (minimum_cost[candidate_id] + extra_seeds > maximum_cost[target_id] ||
+                    minimum_quasi[candidate_id] + extra_seeds > maximum_quasi[target_id]) {
                     continue;
                 }
-                if (!connectivity_exact_quotient(connectivity_pool[coarse_id],
-                                                 connectivity_pool[fine_id],
+                if (!connectivity_exact_quotient(connectivity_pool[target_id],
+                                                 connectivity_pool[candidate_id],
                                                  signature_words)) {
-                    continue;
+                    extra_seeds = connectivity_merge_penalty(
+                        connectivity_pool[candidate_id], connectivity_pool[target_id],
+                        signature_words);
+                    if (extra_seeds <= 0 ||
+                        extra_seeds == std::numeric_limits<int>::max() ||
+                        minimum_cost[candidate_id] + extra_seeds > maximum_cost[target_id] ||
+                        minimum_quasi[candidate_id] + extra_seeds > maximum_quasi[target_id]) {
+                        continue;
+                    }
                 }
-                for (CachedItem* target : survivors[coarse_id]) {
+                for (CachedItem* target : survivors[target_id]) {
                     if (target->cross_dominated) continue;
-                    for (CachedItem* candidate : survivors[fine_id]) {
+                    for (CachedItem* candidate : survivors[candidate_id]) {
                         if (candidate->item->second.cost + extra_seeds >
                             target->item->second.cost) continue;
                         if (candidate->quasi_score + extra_seeds > target->quasi_score)
