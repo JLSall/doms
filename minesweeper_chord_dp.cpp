@@ -107,6 +107,10 @@ struct ProfileStats {
     double dominance_erase = 0.0;
     uint64_t processed_states = 0;
     uint64_t generated_states = 0;
+    uint64_t dominance_budget_exhausted = 0;
+    uint64_t exact_pruned = 0;
+    uint64_t forward_pruned = 0;
+    uint64_t reverse_pruned = 0;
 };
 
 struct Solution {
@@ -2090,6 +2094,42 @@ public:
         }
     }
 
+    // A transition needs to create a record only when its state is new. Probe
+    // once, then construct the record lazily in the vacant slot; replay-mode
+    // chosen histories can be large enough that eager copying is expensive.
+    template <typename MakeRecord>
+    std::pair<iterator, bool> find_or_emplace(State state, MakeRecord&& make_record) {
+        ensure_insert_capacity();
+        const size_t mask = slots_.size() - 1;
+        size_t slot = StateHash{}(state) & mask;
+        size_t first_deleted = std::numeric_limits<size_t>::max();
+        for (;;) {
+            const uint32_t entry = slots_[slot];
+            if (entry == EMPTY) {
+                if (first_deleted != std::numeric_limits<size_t>::max()) {
+                    slot = first_deleted;
+                    --deleted_slots_;
+                } else {
+                    ++used_slots_;
+                }
+                const size_t index = entries_.size();
+                entries_.emplace_back(std::move(state), make_record());
+                alive_.push_back(1);
+                slots_[slot] = static_cast<uint32_t>(index);
+                ++live_size_;
+                return {iterator(this, index), true};
+            }
+            if (entry == DELETED) {
+                if (first_deleted == std::numeric_limits<size_t>::max()) {
+                    first_deleted = slot;
+                }
+            } else if (alive_[entry] && entries_[entry].first == state) {
+                return {iterator(this, entry), false};
+            }
+            slot = (slot + 1) & mask;
+        }
+    }
+
     void erase(iterator where) {
         const size_t entry_index = where.index_;
         if (entry_index >= entries_.size() || !alive_[entry_index]) return;
@@ -2164,7 +2204,16 @@ struct ConnectivityTransition {
     int closed = 0;
 };
 
-using DominanceKey = std::tuple<int, int, int>;
+using DominanceKey = std::pair<uint64_t, int>;
+
+static DominanceKey dominance_key(int cost, int base_hits, int total_hits) {
+    // Encode the two most selective signed fields in one unsigned comparison.
+    // The bit-31 flip preserves the order of signed 32-bit values exactly.
+    const uint64_t primary =
+        (uint64_t{static_cast<uint32_t>(cost + base_hits) ^ UINT32_C(0x80000000)} << 32) |
+        (static_cast<uint32_t>(cost) ^ UINT32_C(0x80000000));
+    return {primary, -total_hits};
+}
 
 // A coarser signature can represent several finer components as one, provided
 // every finer component's future reachability is contained in its representative.
@@ -2421,8 +2470,7 @@ static size_t prune_dominated(FactorTable<FactorBits, TrackChosen>& table,
         const auto [base_hits, total_hits] =
             factor_hit_counts(item->first.hits, base_mask);
         const int flag_hits = total_hits - base_hits;
-        const DominanceKey key{
-            item->second.cost + base_hits, item->second.cost, -total_hits};
+        const DominanceKey key = dominance_key(item->second.cost, base_hits, total_hits);
         const int quasi_score = item->second.cost + base_hits - flag_hits;
         buckets[bucket].entries.push_back(
             CachedItem{item, key, base_hits, flag_hits, quasi_score, false, false});
@@ -2475,6 +2523,7 @@ static size_t prune_dominated(FactorTable<FactorBits, TrackChosen>& table,
                 }
             }
             cached.exact_dominated = is_dominated;
+            if (is_dominated && profile) ++profile->exact_pruned;
             if (!is_dominated) {
                 kept.push_back(&cached);
                 minimum_quasi[connectivity_id] =
@@ -2583,6 +2632,12 @@ static size_t prune_dominated(FactorTable<FactorBits, TrackChosen>& table,
             }
         }
         if (coarser.empty()) continue;
+        auto best_coarse = std::min_element(coarser.begin(), coarser.end(),
+            [&](uint32_t a, uint32_t b) {
+                return std::pair<int, int>{minimum_quasi[a], minimum_cost[a]} <
+                       std::pair<int, int>{minimum_quasi[b], minimum_cost[b]};
+            });
+        std::iter_swap(coarser.begin(), best_coarse);
         for (CachedItem* cached : survivors[fine_id]) {
             bool is_dominated = false;
             for (uint32_t coarse_id : coarser) {
@@ -2601,6 +2656,7 @@ static size_t prune_dominated(FactorTable<FactorBits, TrackChosen>& table,
                 if (is_dominated || exhausted) break;
             }
             cached->cross_dominated = is_dominated;
+            if (is_dominated && profile) ++profile->forward_pruned;
             if (exhausted) break;
         }
     }
@@ -2652,6 +2708,7 @@ static size_t prune_dominated(FactorTable<FactorBits, TrackChosen>& table,
                                 candidate->item->first.hits, target->item->first.hits,
                                 base_mask, allowance)) {
                             target->cross_dominated = true;
+                            if (profile) ++profile->reverse_pruned;
                             break;
                         }
                     }
@@ -2662,6 +2719,7 @@ static size_t prune_dominated(FactorTable<FactorBits, TrackChosen>& table,
         }
     }
     const auto cross_end = profile ? std::chrono::steady_clock::now() : exact_end;
+    if (exhausted && profile) ++profile->dominance_budget_exhausted;
 
     size_t removed = 0;
     for (auto& bucket : buckets) {
@@ -3153,17 +3211,17 @@ static Solution solve_frontier_core(const Model& original_model,
                         }
                     }
                     StateType state{connectivity_id, std::move(new_hits)};
-                    auto found = next.find(state);
-                    if (found == next.end()) {
+                    auto [found, inserted] = next.find_or_emplace(
+                        std::move(state), [&]() {
                         if constexpr (TrackChosen) {
                             Bits new_chosen = old_record.chosen;
                             if (selected) set_bit(new_chosen, i);
-                            next.emplace(std::move(state),
-                                         Record<true>{new_cost, std::move(new_chosen)});
+                            return Record<true>{new_cost, std::move(new_chosen)};
                         } else {
-                            next.emplace(std::move(state), Record<false>{new_cost});
+                            return Record<false>{new_cost};
                         }
-                    } else if (new_cost < found->second.cost) {
+                    });
+                    if (!inserted && new_cost < found->second.cost) {
                         found->second.cost = new_cost;
                         if constexpr (TrackChosen) {
                             found->second.chosen = old_record.chosen;
@@ -3893,6 +3951,11 @@ int main(int argc, char** argv) {
                       << "Profile: processed " << comma_number(p.processed_states)
                       << " states; generated " << comma_number(p.generated_states)
                       << " pre-pruning states\n";
+            std::cerr << "Profile: dominance removed " << comma_number(p.exact_pruned)
+                      << " exact, " << comma_number(p.forward_pruned)
+                      << " forward, " << comma_number(p.reverse_pruned)
+                      << " reverse; budget exhausted in "
+                      << p.dominance_budget_exhausted << " layers\n";
         }
         std::cerr << "Solve time: " << std::fixed << std::setprecision(3)
                   << solution.solve_seconds << " seconds\n";
