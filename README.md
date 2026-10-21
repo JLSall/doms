@@ -14,13 +14,15 @@ The program optimizes the complete click sequence, including:
 - chord clicks; and
 - ordinary left-clicks needed for 3BV openings not reached by a chord.
 
-It outputs both the optimal number of clicks and a valid sequence of actions
-that achieves it. The solver is exact: dominance pruning affects performance,
-not the correctness of the result.
+By default, a single-board solve outputs both the optimal number of clicks and
+a valid sequence of actions that achieves it. `--count-only` omits the replay
+and is the default for bulk runs. Both modes are exact.
 
 The solver is a standalone C++17 program with no third-party libraries.
 Importing a World of Minesweeper game URL requires an installed Chrome,
-Edge, or Chromium browser. It does not require Python.
+Edge, or Chromium browser. PTTACG strings, LlamaSweeper URLs, MBF input, and
+random generation work offline without a browser. No Python script is needed
+to compile or run the current C++ solver, including its game-URL importer.
 
 ## Building
 
@@ -39,15 +41,9 @@ g++ -std=c++17 -O3 -DNDEBUG -march=native -pthread minesweeper_chord_dp.cpp -o d
 
 With Clang, replace `g++` with `clang++`.
 
-### Windows with Visual C++
-
-Open an **x64 Native Tools Command Prompt for Visual Studio** and run:
-
-```console
-cl /std:c++17 /O2 /DNDEBUG /EHsc minesweeper_chord_dp.cpp /Fe:doms.exe
-```
-
 ### Windows with MinGW-w64
+
+Use a MinGW-w64 GCC toolchain, such as the MSYS2 UCRT64 environment:
 
 ```console
 g++ -std=c++17 -O3 -DNDEBUG -pthread minesweeper_chord_dp.cpp -o doms.exe
@@ -66,7 +62,9 @@ Windows may close a crashing console program without printing an exception;
 can reveal the exit code. With MinGW GDB, `gdb --args doms.exe BOARD` followed
 by `run` and `bt` at the GDB prompt captures the faulting call stack.
 
-The resulting executable does not require Python.
+The source currently uses GCC/Clang bit-count intrinsics; the Microsoft
+`cl` compiler is not supported as written. The resulting executable does not
+require Python.
 
 ## Quick start
 
@@ -105,8 +103,9 @@ or click-tuple output.
 
 ## Input formats
 
-The program automatically distinguishes PTTACG input from MBF input. Text-grid
-input is not supported.
+The program automatically recognizes PTTACG strings, compatible LlamaSweeper
+URLs, World of Minesweeper game URLs, and MBF input. Text-grid input is not
+supported.
 
 ### PTTACG string or compatible LlamaSweeper URL
 
@@ -132,8 +131,9 @@ The standard board codes are:
 | `b=2` | 16 x 16 |
 | `b=3` | 30 x 16 |
 
-Unambiguous custom-dimension codes are also supported. The `m=` value is the
-row-major mine bitfield, packed five cells per character with the alphabet
+Unambiguous custom-dimension codes are also supported, such as `b=3020` for
+30 x 20 and `b=3030` for 30 x 30. A leading `?` is optional. The `m=` value is
+the row-major mine bitfield, packed five cells per character with the alphabet
 `0-9a-v`.
 
 ### World of Minesweeper game URL
@@ -161,6 +161,12 @@ is also in `imported_board_url`. This import needs internet access and works
 for completed, won games: once every safe cell is open, every closed cell is a
 mine. It cannot infer all mines from an unfinished or lost game's visible
 cells. The game URL contains an ID, not the board data.
+
+If no suitable browser is found, this input produces a descriptive error and
+exits with status `2`. Browser detection runs only for World of Minesweeper
+game URLs; it is not needed for `.mbf` files or LlamaSweeper URLs. The importer
+depends on the site's rendered cell markup and can fail if the game does not
+load or that markup changes.
 
 ### MBF file or hexadecimal
 
@@ -220,7 +226,7 @@ The CSV contains exactly these columns:
 
 ```csv
 board,3bv,optimal_clicks
-"b=1&m=004g00a80g2005200",22,14
+"b=1&m=080212g040002k00g",16,12
 ```
 
 `board` is the bare PTTACG string. The CSV is written to standard output; the
@@ -236,15 +242,18 @@ Bulk generation uses `std::mt19937_64` and unbiased rejection sampling. Supply
 
 Bulk runs use count-only DP by default: states store the cost but no chord set,
 and the solver does not reconstruct moves. By default, the solver starts one
-worker per available core (or fewer if there are fewer boards). Use `--threads N`
+worker per hardware thread reported by `std::thread::hardware_concurrency()`
+(falling back to one, and using no more workers than boards). Use `--threads N`
 to set the number of worker threads, including `--threads 1` for sequential
 execution. Board generation uses a single RNG on the main thread, so a seed
 produces the same boards and CSV row order at every thread count.
 
 For a single board, replay remains the default. Use `--count-only` to print
-only the optimal click count and DP statistics, or `--no-count-only` to request
-the full replay in a bulk run. Count-only JSON omits move and breakdown fields.
-`--click-tuples` requires replay.
+only the optimal click count and DP statistics. `--no-count-only` enables
+reconstruction and validation during bulk runs too, but the CSV still contains
+only the three columns above. Count-only JSON omits move and breakdown fields.
+`--click-tuples` requires replay. Each worker solves one board at a time; use
+fewer threads if simultaneous difficult boards consume too much memory.
 
 ## Output formats and coordinates
 
@@ -265,7 +274,9 @@ The default output includes:
 - frontier-DP statistics; and
 - the complete ordered action sequence.
 
-Elapsed solve time is always printed to standard error.
+Elapsed solve time is always printed to standard error. For a single board it
+covers model construction, preprocessing, ordering, DP, and any reconstruction
+and validation. It excludes input loading, browser startup, and output printing.
 
 ### Click tuples
 
@@ -320,19 +331,20 @@ World of Minesweeper game URL, MBF filename, or quoted MBF hexadecimal.
 | `--generate beginner\|intermediate\|expert` | Generate, print, and solve one random standard board. Do not also supply `BOARD`. |
 | `--bulk beginner\|intermediate\|expert COUNT` | Generate and optimally solve `COUNT` boards, writing `board,3bv,optimal_clicks` CSV to standard output. |
 | `--seed N` | Reproduce a generated board or complete bulk sequence. Requires `--generate` or `--bulk`. |
-| `--threads N` | Set the number of bulk solver threads; default is one per available core. Requires `--bulk`. |
+| `--threads N` | Set the number of bulk solver threads; default uses `hardware_concurrency()`, with a fallback of one. Requires `--bulk`. |
 | `--count-only` | Store only state costs and omit move reconstruction; default for bulk runs. |
-| `--no-count-only` | Reconstruct moves; default for single boards. |
-| `--order NAME` | Choose `auto` (the default) or any sweep order printed on the `DP:` line. Examples include `columns-reverse-smart`, `rows-reverse-band-2`, and `columns-reverse-dynamic-2.1.1.1.4.1.1.1.1.1.1.1`. See below for the naming rules. |
+| `--no-count-only` | Reconstruct and validate moves; default for single boards. Bulk output remains CSV. |
+| `--order NAME` | Choose `auto` (the default) or any sweep order printed on the `DP:` line. Examples include `columns-reverse-smart`, `rows-reverse-band-2`, and `columns-reverse-dynamic`. See below for the naming rules. |
 | `--band-size N` | Force a fixed band width of `N` rows or columns. With `--order auto`, compare both orientations; with a plain row or column order, use that direction. |
 | `--progress` | Print frontier size and pruning progress for one board; print completed boards during bulk runs. |
-| `--profile` | Print phase timings, dominance details, and processed/generated state counts to standard error for a single board. |
+| `--profile` | Print phase timings, dominance details, and state/branch counts to standard error. Single boards only, including `--generate`; cannot be combined with `--bulk`. |
 | `--json` | Print machine-readable JSON. |
 | `--click-tuples` | Print only `(click_type, x, y)` tuples. |
 | `-h`, `--help` | Display command-line help. |
 
-The program exits with status `0` on success and `2` after an input, resource,
-or validation error.
+The program exits with status `0` on success and `2` after a caught input,
+resource, or validation error. There is no configurable state-count ceiling
+or dominance-comparison budget.
 
 ## Useful examples
 
@@ -364,6 +376,25 @@ Find where one solve spends its time (including dominance subphases):
 ./doms example.mbf --profile
 ./doms example.mbf --count-only --profile
 ```
+
+`--profile` reports model construction, candidate reduction, ordering, factor
+planning, DP setup, transitions, dominance, and move reconstruction. Dominance
+is further split into setup, same-connectivity checks, forward and compensated
+cross-connectivity checks, erasure, and cleanup. The final counters report:
+
+- states processed and distinct successor states generated, after cheap
+  conditional pruning and duplicate merging but before full dominance;
+- branches skipped by conditional dominance;
+- full dominance passes and intermediate cuts where those passes were deferred;
+- peak generated states; and
+- states removed by exact, forward, and reverse dominance.
+
+Here, `exact` means identical-connectivity pruning, and `reverse` includes the
+cost-compensated connectivity checks. All three pruning rules are exact.
+`peak_dp_states` (also printed on the `DP:` line) is the largest table retained
+between candidate steps, including intermediate steps where full pruning is
+deferred. It can differ from the pre-pruning peak reported by `--profile`.
+Timing and profile text stay on standard error even with `--json`.
 
 ## What is being optimized?
 
@@ -416,6 +447,14 @@ Candidates are processed in a spatial sweep. A boundary state records:
 - the future reachability of each unfinished selected-chord component; and
 - which active mine-flag and 3BV-coverage factors have already been hit.
 
+Each candidate has a skip branch and a chord branch. Before constructing both,
+DOMS uses cached connectivity relations and a cheap cost inequality to discard
+a branch when its sibling provably dominates it. It then normalizes and merges
+duplicate states. These inexpensive operations run after every candidate;
+the full dominance passes run after **two candidates**, and after the final
+candidate if it is an unpaired tail. This gives both candidates' effects a
+chance to combine before the more expensive comparisons.
+
 Equivalent histories are merged. Connectivity signatures are interned per
 layer, and DP states are held in a dense open-addressed table. Mine/3BV factors
 receive reusable slots for only the portion of the sweep in which they are
@@ -425,6 +464,9 @@ bitset fallback. Future connectivity contacts likewise receive stable reusable
 boundary slots. Standard boards therefore store each unfinished component in
 one or two 64-bit words rather than a bitset spanning every chord candidate;
 boundaries requiring more than 128 slots use the general representation.
+Connectivity transitions are cached per signature within each candidate step.
+Count-only mode uses a separate template specialization that omits the chosen
+chord history from every state and skips move reconstruction and validation.
 
 DOMS also applies **opening-chain absorption**, an exact state equivalence. If
 an unfinished chord component can reach exactly the undecided border of one
@@ -443,21 +485,35 @@ The solver also applies exact dominance pruning:
 - Between compatible connectivity signatures, a coarser partition may dominate
   a finer partition when it can never require more future component-seeding
   clicks.
+- A cheaper state with finer connectivity can also dominate a coarser state
+  when its saving covers a proven upper bound on the extra seed clicks.
+  A common-merge bound extends this cost-compensated rule to some incomparable
+  connectivity signatures as well.
 
-Connectivity dominance uses safe scalar and component-size prefilters before
-performing the full subset and matching test. The comparison cap limits
-state-to-state dominance comparisons per layer; structural signature tests are
-evaluated lazily. Reaching the cap merely retains more states. It never removes
-a state without proof and therefore does not make the answer approximate.
+The pruning passes run in that order: identical connectivity, coarsening, then
+cost-compensated connectivity. They share buckets grouped by total future
+reachability, cached factor counts, and sorted cost keys. Safe cost and
+component-size filters reject impossible comparisons before the full
+connectivity tests. Sorted cost cutoffs stop scans once later witnesses cannot
+afford to dominate the target; the compensated pass skips targets already
+removed by coarsening dominance.
+
+**Dominance pruning has no comparison budget.** Every scheduled pass runs
+without a numerical comparison limit, retaining the safe filters and early
+exits above. Budget counters, exhaustion checks, and exhaustion reporting have
+also been removed. Removing the cap can reduce total runtime and memory by
+preventing avoidable states from accumulating in later layers. It does not
+guarantee a faster solve on every board, and it does not change exactness.
 
 For `--order auto`, the program evaluates row, column, and promising banded
 orders in all four sweep directions: left-to-right, right-to-left,
-top-to-bottom, and bottom-to-top. It first minimizes estimated peak frontier
-width, then the connectivity portion of a tied frontier, and finally estimated
-total work. Connectivity receives the tie-break because component partitions
-are more expensive than an equal number of independent factor bits. This is
-important for rectangular Expert boards, where sweep direction can have a
-large effect.
+top-to-bottom, and bottom-to-top. The final selection minimizes **estimated
+peak total width plus estimated peak connectivity width**, then peak total
+width, then estimated total work; the order name breaks remaining ties.
+This gives extra weight to connectivity because component relationships are
+more expensive than independent factor bits. Ordering is a performance
+heuristic, not a guarantee of the fastest possible solve. Direction matters
+especially on rectangular Expert boards.
 
 Automatic ordering also tries bands whose widths change across the board. It
 computes the frontier profile for each contiguous band of one through eight
@@ -479,62 +535,64 @@ plain row or column direction (with optional `-reverse`).
 
 ## Complexity and limitations
 
-The algorithm is exact but exponential. It is best viewed as fixed-parameter
-tractable in the maximum frontier width rather than polynomial in total board
-area.
+The algorithm is exact but exponential. Its practical cost depends strongly on
+frontier width, connectivity, and the number of states that survive merging
+and pruning; it is not polynomial in board area.
 
-Let:
+For an `n x m` board with `k` mines, there are at most `nm - k` original chord
+candidates. Let `q` be the number remaining after proven reduction. There are
+at most `2^q` chord subsets, but many partial subsets have the same boundary
+state or are dominated. Future-reach masks of different unfinished components
+can overlap, so they should not be counted as an ordinary partition of future
+boundary positions.
 
-- `q0` be the original number of numbered safe squares that could be chorded;
-- `q` be the number left after proven candidate reduction (`q <= q0`);
-- `d` be the largest propagation neighborhood examined by the local reduction;
-- `b` be the maximum number of future-relevant connectivity items at a cut;
-- `f` be the maximum number of active mine/3BV factors; and
-- `S` be the maximum number of retained DP states.
+For the main DP storage, let:
 
-A conservative state bound is:
+- `S` be the largest number of distinct states in a layer, including states
+  awaiting full dominance pruning;
+- `R` be the largest number of interned connectivity signatures;
+- `c` be the largest number of unfinished components in a signature;
+- `F` be the number of 64-bit words stored for a factor mask, at least one;
+- `B` be the number of 64-bit words stored per component's future-reach mask;
+  this is one or two on the compact path; and
+- `H = ceil(q / 64)` be the chosen-chord history size in replay mode.
 
-```text
-S <= min(2^q, Bell(b + 1) * 2^f)
-```
-
-For a somewhat more implementation-specific view, let `R` be the maximum
-number of distinct connectivity signatures in a layer, `c <= b` the maximum
-number of unfinished components, `D` the internal dominance-comparison limit,
-and `w = 64` the bitset word size. The main state storage is approximately
-
-```text
-O(S * (ceil(f/w) + ceil(q/w)) + R * c * ceil(b/w)).
-```
-
-A conservative time bound for all `q` layers includes
+Ignoring preprocessing data and auxiliary pruning indexes, the main DP tables
+and connectivity pools use approximately:
 
 ```text
-O(q * (S*(f+q)/w
-       + R*c*log(c)*b/w
-       + D*f/w
-       + R^2*(c^2*b/w + c^3))).
+Count-only: O(S * (1 + F)     + R * c * B)
+Replay:     O(S * (1 + F + H) + R * c * B)
 ```
 
-This deliberately overstates typical behavior: connectivity transitions are
-cached, dominance normally stops early, and safe prefilters reject most
-signature pairs without running the full matching test. Actual performance
-depends heavily on the board, processing order, state merging, and dominance
-pruning.
+The old and new tables coexist during a transition. Each bulk worker has its
+own DP tables, so parallel solves add to peak memory use.
+
+Without a comparison budget, a full dominance pass can examine `O(S^2)`
+state pairs in the worst case, with `O(F)` work for each factor comparison.
+Sorting costs `O(S log S)`. Structural connectivity checks can additionally
+examine `O(R^2)` signature pairs, with a conservative bound of
+`O(c^2 * B + c^3)` per pair for bitset and matching work. There are
+`ceil(q / 2)` full pruning passes. These bounds are deliberately pessimistic:
+shared buckets, cached relations, scalar filters, cost cutoffs, and early
+successes avoid most potential comparisons on typical boards. Transition,
+ordering, and preprocessing work are additional costs.
 
 Candidate preprocessing performs polynomial subset and connectivity checks for
-swap domination. Its local independent-set certificate is exponential in `d`
-in the worst case, although dense opening boundaries prune strongly; a
-neighborhood larger than 63 is conservatively left unreduced. This does not
-affect exactness. On intended boards, the reduced `q`, `b`, and `f` generally
-save much more time than preprocessing consumes.
+swap domination. Its local independent-set certificate is exponential in the
+largest examined propagation neighborhood size `d` in the worst case, although
+dense opening boundaries prune strongly; a neighborhood larger than 63 is
+conservatively left unreduced by this certificate. This does not affect
+exactness. On intended boards, reducing candidate count and frontier width
+generally saves much more time than preprocessing consumes.
 
 Some unusually connected boards can still use a large amount of memory or take
 a long time. Useful responses are:
 
-1. Enable `--progress` to identify where the frontier grows.
-2. Try `--order rows` and `--order columns` explicitly.
-3. Experiment with a small `--band-size`.
+1. Enable `--profile` for a timing breakdown and `--progress` to locate growth.
+2. Use `--count-only` if you do not need the actual moves.
+3. Compare explicit directions or dynamic-band orders using `--order`.
+4. Reduce `--threads` for bulk runs if concurrent boards use too much memory.
 
 The solver assumes that all mine locations are already known and that flags may
 be placed before their neighboring numbered squares are opened. It is not a
@@ -545,14 +603,17 @@ solver for discovering an unknown board without guessing.
 Compile with warnings enabled:
 
 ```console
-g++ -std=c++17 -O3 -DNDEBUG -Wall -Wextra -Wpedantic minesweeper_chord_dp.cpp -o doms
+g++ -std=c++17 -O3 -DNDEBUG -pthread -Wall -Wextra -Wpedantic minesweeper_chord_dp.cpp -o doms
 ```
 
 Compile with AddressSanitizer and UndefinedBehaviorSanitizer:
 
 ```console
-g++ -std=c++17 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer minesweeper_chord_dp.cpp -o doms_san
+g++ -std=c++17 -O1 -g -pthread -fsanitize=address,undefined -fno-omit-frame-pointer minesweeper_chord_dp.cpp -o doms_san
 ```
 
 Run representative PTTACG and MBF boards through both builds and compare their
-optimal click counts and action sequences.
+optimal click counts. Replay mode automatically checks that its action count
+matches the DP result and simulates the moves to confirm that all safe cells
+are opened legally. Compare count-only and replay results as well. Tied
+optimal solutions may use different action sequences.
