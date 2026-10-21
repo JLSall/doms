@@ -8,6 +8,7 @@
 #include <cctype>
 #include <cstdint>
 #include <cstdlib>
+#include <deque>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -31,6 +32,8 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
+
+#include "benchmarks/expert_benchmark_reference.h"
 
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -1013,13 +1016,23 @@ static CandidateReduction reduce_candidates(const Model& original, bool progress
         std::vector<uint8_t> keep(q, 1);
         int swaps_removed = 0;
         for (int victim = 0; victim < q; ++victim) {
-            for (int replacement = 0; replacement < q; ++replacement) {
-                if (keep[replacement] &&
-                    swap_dominated_candidate(relations, victim, replacement)) {
-                    keep[victim] = 0;
-                    ++swaps_removed;
-                    break;
+            // Only propagation neighbors can replace the victim. Enumerate
+            // their bits in ascending candidate order to preserve the first
+            // valid replacement and the batch's sequential deletion choices.
+            for (size_t word = 0; word < relations.propagation[victim].size(); ++word) {
+                uint64_t neighbors = relations.propagation[victim][word];
+                while (neighbors) {
+                    const int replacement = static_cast<int>(
+                        word * 64 + __builtin_ctzll(neighbors));
+                    neighbors &= neighbors - 1;
+                    if (keep[replacement] &&
+                        swap_dominated_candidate(relations, victim, replacement)) {
+                        keep[victim] = 0;
+                        ++swaps_removed;
+                        break;
+                    }
                 }
+                if (!keep[victim]) break;
             }
         }
         if (swaps_removed) {
@@ -1103,14 +1116,16 @@ static WidthEstimate width_estimate(const Model& model, const std::vector<int>& 
     if (end_cut < 0) end_cut = q - 1;
     std::vector<int> inverse(q);
     for (int i = 0; i < q; ++i) inverse[order[i]] = i;
-    std::vector<std::pair<int, int>> graph_intervals;
+    // Each interval contributes on [first, last). Accumulate endpoint
+    // changes once instead of rescanning every interval at every cut.
+    std::vector<int> graph_delta(q + 1, 0), factor_delta(q + 1, 0);
     for (int old : order) {
         const int position = inverse[old];
         int last = position;
         for (int other : model.graph[old]) {
             if (inverse[other] > position) last = std::max(last, inverse[other]);
         }
-        if (last > position) graph_intervals.emplace_back(position, last - 1);
+        if (last > position) { ++graph_delta[position]; --graph_delta[last]; }
     }
     for (const auto& scope : model.zero_scopes) {
         if (scope.empty()) continue;
@@ -1120,9 +1135,8 @@ static WidthEstimate width_estimate(const Model& model, const std::vector<int>& 
             first = std::min(first, inverse[item]);
             last = std::max(last, inverse[item]);
         }
-        if (first < last) graph_intervals.emplace_back(first, last - 1);
+        if (first < last) { ++graph_delta[first]; --graph_delta[last]; }
     }
-    std::vector<std::pair<int, int>> factor_intervals;
     auto add_factors = [&](const std::vector<std::vector<int>>& scopes) {
         for (const auto& scope : scopes) {
             if (scope.empty()) continue;
@@ -1132,7 +1146,7 @@ static WidthEstimate width_estimate(const Model& model, const std::vector<int>& 
                 first = std::min(first, inverse[item]);
                 last = std::max(last, inverse[item]);
             }
-            if (first < last) factor_intervals.emplace_back(first, last - 1);
+            if (first < last) { ++factor_delta[first]; --factor_delta[last]; }
         }
     };
     add_factors(model.mine_scopes);
@@ -1141,17 +1155,31 @@ static WidthEstimate width_estimate(const Model& model, const std::vector<int>& 
     int max_factors = 0;
     int max_total = 0;
     uint64_t work = 0;
-    for (int cut = first_cut; cut < end_cut; ++cut) {
-        int graph = 0;
-        int factors = 0;
-        for (auto [lo, hi] : graph_intervals) graph += lo <= cut && cut <= hi;
-        for (auto [lo, hi] : factor_intervals) factors += lo <= cut && cut <= hi;
+    int graph = 0, factors = 0;
+    for (int cut = 0; cut < end_cut; ++cut) {
+        graph += graph_delta[cut];
+        factors += factor_delta[cut];
+        if (cut < first_cut) continue;
         max_graph = std::max(max_graph, graph);
         max_factors = std::max(max_factors, factors);
         max_total = std::max(max_total, graph + factors);
         work = saturated_add(work, estimated_cut_work(graph + factors));
     }
     return {max_total, max_graph, max_factors, work};
+}
+
+// For each bit, add the lower half of each block into its upper half.
+// This visits exactly the masks containing that bit, in ascending order,
+// without a conditional per mask. The contiguous inner loop can vectorize.
+static void subset_zeta(std::vector<int>& counts) {
+    const size_t size = counts.size(); // Callers supply a power-of-two size.
+    for (size_t half = 1; half < size; half *= 2) {
+        for (size_t block = 0; block < size; block += 2 * half) {
+            for (size_t offset = 0; offset < half; ++offset) {
+                counts[block + half + offset] += counts[block + offset];
+            }
+        }
+    }
 }
 
 // Optimize the order inside each row or column while retaining the global
@@ -1172,10 +1200,36 @@ static std::vector<int> smart_line_order_indices(const Model& model,
         const int cell = model.candidates[candidate];
         return by_columns ? cell / model.width : cell % model.width;
     };
-    auto sweep_line = [&](int candidate) {
+    // Scope and neighbor scans revisit each candidate for every sweep line.
+    // Classify once, avoiding repeated coordinate division in those scans.
+    std::vector<int> sweep_lines(q);
+    for (int candidate = 0; candidate < q; ++candidate) {
         const int line = primary(candidate);
-        return reverse_lines ? line_count - 1 - line : line;
+        sweep_lines[candidate] = reverse_lines ? line_count - 1 - line : line;
+    }
+    auto sweep_line = [&](int candidate) { return sweep_lines[candidate]; };
+
+    // Only scopes whose first or last line is the current line need a
+    // detailed scan. Interior crossings are always live; exterior scopes
+    // cannot cross any cut within this line.
+    using ScopeExtent = std::pair<int, int>;
+    auto scope_extents = [&](const std::vector<std::vector<int>>& scopes) {
+        std::vector<ScopeExtent> extents;
+        extents.reserve(scopes.size());
+        for (const auto& scope : scopes) {
+            int first = line_count, last = -1;
+            for (int candidate : scope) {
+                const int line = sweep_line(candidate);
+                first = std::min(first, line);
+                last = std::max(last, line);
+            }
+            extents.emplace_back(first, last);
+        }
+        return extents;
     };
+    const auto zero_extents = scope_extents(model.zero_scopes);
+    const auto mine_extents = scope_extents(model.mine_scopes);
+    const auto base_extents = scope_extents(model.base_scopes);
 
     std::vector<std::vector<int>> lines(line_count);
     for (int candidate = 0; candidate < q; ++candidate) {
@@ -1210,10 +1264,11 @@ static std::vector<int> smart_line_order_indices(const Model& model,
         for (int bit = 0; bit < p; ++bit) local_bit[line[bit]] = bit;
 
         auto crossing_counts = [&](const std::vector<std::vector<int>>& first,
-                                   const std::vector<std::vector<int>>* second = nullptr) {
+                                   const std::vector<ScopeExtent>& first_extents,
+                                   const std::vector<std::vector<int>>* second = nullptr,
+                                   const std::vector<ScopeExtent>* second_extents = nullptr) {
             std::vector<int> before_only(state_count, 0);
             std::vector<int> after_only(state_count, 0);
-            std::vector<int> current_only(state_count, 0);
             int always = 0;
             int before_total = 0;
             int after_total = 0;
@@ -1236,36 +1291,39 @@ static std::vector<int> smart_line_order_indices(const Model& model,
                     ++after_only[mask];
                     ++after_total;
                 } else if (mask) {
-                    ++current_only[mask];
+                    ++before_only[mask];
+                    ++after_only[mask];
                     ++current_total;
                 }
             };
-            for (const auto& scope : first) if (!scope.empty()) add_scope(scope);
-            if (second) for (const auto& scope : *second) if (!scope.empty()) add_scope(scope);
-            auto zeta = [&](std::vector<int>& counts) {
-                for (int bit = 0; bit < p; ++bit) {
-                    for (uint32_t mask = 0; mask < state_count; ++mask) {
-                        if (mask & (uint32_t{1} << bit)) {
-                            counts[mask] += counts[mask ^ (uint32_t{1} << bit)];
-                        }
-                    }
+            auto add_scopes = [&](const std::vector<std::vector<int>>& scopes,
+                                  const std::vector<ScopeExtent>& extents) {
+                for (size_t i = 0; i < scopes.size(); ++i) {
+                    const auto [begin, end] = extents[i];
+                    if (begin > line_number || end < line_number) continue;
+                    if (begin < line_number && end > line_number) ++always;
+                    else add_scope(scopes[i]);
                 }
             };
-            zeta(before_only);
-            zeta(after_only);
-            zeta(current_only);
+            add_scopes(first, first_extents);
+            if (second) add_scopes(*second, *second_extents);
+            subset_zeta(before_only);
+            subset_zeta(after_only);
+            // A current-line scope contributes to both subtracted subset
+            // sums. Linearity lets us fold it into the before/after arrays
+            // before transforming, saving a third transform and its buffer.
             std::vector<int> answer(state_count, always);
             for (uint32_t mask = 0; mask < state_count; ++mask) {
                 answer[mask] += before_total - before_only[mask];
                 answer[mask] += after_total - after_only[all ^ mask];
-                answer[mask] += current_total - current_only[mask]
-                    - current_only[all ^ mask];
+                answer[mask] += current_total;
             }
             return answer;
         };
 
-        std::vector<int> graph_cost = crossing_counts(model.zero_scopes);
-        std::vector<int> factor_cost = crossing_counts(model.mine_scopes, &model.base_scopes);
+        std::vector<int> graph_cost = crossing_counts(model.zero_scopes, zero_extents);
+        std::vector<int> factor_cost = crossing_counts(model.mine_scopes, mine_extents,
+                                                      &model.base_scopes, &base_extents);
 
         // Candidate connectivity vertices are live when the vertex has been
         // processed but at least one graph neighbor has not.
@@ -1289,13 +1347,7 @@ static std::vector<int> smart_line_order_indices(const Model& model,
                 ++old_total;
             }
         }
-        for (int bit = 0; bit < p; ++bit) {
-            for (uint32_t mask = 0; mask < state_count; ++mask) {
-                if (mask & (uint32_t{1} << bit)) {
-                    old_masks[mask] += old_masks[mask ^ (uint32_t{1} << bit)];
-                }
-            }
-        }
+        subset_zeta(old_masks);
         std::vector<uint32_t> same_line_neighbors(p, 0);
         std::vector<uint8_t> has_later_neighbor(p, 0);
         for (int bit = 0; bit < p; ++bit) {
@@ -1892,37 +1944,82 @@ struct WordsHash {
 // state needs only a 32-bit ID.
 class ConnectivityPool {
 public:
-    ConnectivityPool() { intern(std::vector<uint64_t>{}); }
+    ConnectivityPool() { reset(); }
 
     uint32_t intern(const std::vector<uint64_t>& signature) {
-        auto found = ids_.find(signature);
-        if (found != ids_.end()) return found->second;
+        const size_t hash = WordsHash{}(signature);
+        size_t slot = hash & (slots_.size() - 1);
+        while (slots_[slot] != empty_slot) {
+            const auto& entry = *by_id_[slots_[slot]];
+            if (entry.hash == hash && entry.signature == signature) return slots_[slot];
+            slot = (slot + 1) & (slots_.size() - 1);
+        }
+        // Grow only for a new signature. Existing signatures keep their IDs,
+        // and deque insertion preserves references used by DP transitions.
+        if (by_id_.size() >= empty_slot)
+            throw std::length_error("too many connectivity signatures");
+        if (by_id_.size() + 1 > slots_.size() / 2) {
+            rehash(capacity_for(by_id_.size() + 1));
+            slot = hash & (slots_.size() - 1);
+            while (slots_[slot] != empty_slot) slot = (slot + 1) & (slots_.size() - 1);
+        }
         const uint32_t id = static_cast<uint32_t>(by_id_.size());
-        auto inserted = ids_.emplace(signature, id).first;
-        by_id_.push_back(&inserted->first);
+        entries_.push_back(Entry{signature, hash});
+        by_id_.push_back(&entries_.back());
+        slots_[slot] = id;
         return id;
     }
 
-    const std::vector<uint64_t>& operator[](uint32_t id) const { return *by_id_[id]; }
+    const std::vector<uint64_t>& operator[](uint32_t id) const { return by_id_[id]->signature; }
     size_t size() const { return by_id_.size(); }
     void reserve(size_t count) {
-        ids_.reserve(count);
+        const size_t capacity = capacity_for(count);
+        if (capacity > slots_.size()) rehash(capacity);
         by_id_.reserve(count);
     }
     void reset(size_t reserve_count = 0) {
-        ids_.clear();
         by_id_.clear();
-        reserve(reserve_count);
+        entries_.clear();
+        by_id_.reserve(reserve_count);
+        slots_.assign(capacity_for(reserve_count), empty_slot);
         intern(std::vector<uint64_t>{});
     }
     void swap(ConnectivityPool& other) noexcept {
-        ids_.swap(other.ids_);
+        slots_.swap(other.slots_);
         by_id_.swap(other.by_id_);
+        entries_.swap(other.entries_);
     }
 
 private:
-    std::unordered_map<std::vector<uint64_t>, uint32_t, WordsHash> ids_;
-    std::vector<const std::vector<uint64_t>*> by_id_;
+    struct Entry {
+        std::vector<uint64_t> signature;
+        size_t hash;
+    };
+    static constexpr uint32_t empty_slot = std::numeric_limits<uint32_t>::max();
+    // IDs, rather than pointers, keep the lookup array compact. Signatures
+    // stay in stable storage so interning cannot invalidate a caller's input.
+    std::vector<uint32_t> slots_;
+    std::deque<Entry> entries_;
+    std::vector<const Entry*> by_id_;
+
+    static size_t capacity_for(size_t count) {
+        size_t capacity = 16;
+        while (capacity / 2 < count) {
+            if (capacity > std::numeric_limits<size_t>::max() / 2)
+                throw std::length_error("connectivity pool capacity overflow");
+            capacity *= 2;
+        }
+        return capacity;
+    }
+    void rehash(size_t capacity) {
+        std::vector<uint32_t> slots(capacity, empty_slot);
+        for (uint32_t id = 0; id < by_id_.size(); ++id) {
+            size_t slot = by_id_[id]->hash & (capacity - 1);
+            while (slots[slot] != empty_slot) slot = (slot + 1) & (capacity - 1);
+            slots[slot] = id;
+        }
+        slots_.swap(slots);
+    }
 };
 
 template <typename FactorBits>
@@ -2101,61 +2198,88 @@ public:
     // chosen histories can be large enough that eager copying is expensive.
     template <typename MakeRecord>
     std::pair<iterator, bool> find_or_emplace(State state, MakeRecord&& make_record) {
-        ensure_insert_capacity();
-        const size_t mask = slots_.size() - 1;
-        size_t slot = StateHash{}(state) & mask;
-        size_t first_deleted = std::numeric_limits<size_t>::max();
+        if (slots_.empty()) reserve(live_size_ + 1);
+        // Probe before growing the index. Most generated successors can be
+        // duplicates, and those lookups do not need insertion capacity.
+        // Grow only after finding an empty slot for a genuinely new state.
+        // Reuse a tombstone without growing, since it does not increase the
+        // number of occupied slots.
         for (;;) {
-            const uint32_t entry = slots_[slot];
-            if (entry == EMPTY) {
-                if (first_deleted != std::numeric_limits<size_t>::max()) {
-                    slot = first_deleted;
-                    --deleted_slots_;
-                } else {
-                    ++used_slots_;
+            const size_t mask = slots_.size() - 1;
+            size_t slot = StateHash{}(state) & mask;
+            size_t first_deleted = std::numeric_limits<size_t>::max();
+            for (;;) {
+                const uint32_t entry = slots_[slot];
+                if (entry == EMPTY) {
+                    if (first_deleted != std::numeric_limits<size_t>::max()) {
+                        slot = first_deleted;
+                        --deleted_slots_;
+                    } else {
+                        if ((used_slots_ + 1) * 4 > slots_.size() * 3) {
+                            ensure_insert_capacity();
+                            break;
+                        }
+                        ++used_slots_;
+                    }
+                    const size_t index = entries_.size();
+                    entries_.emplace_back(std::move(state), make_record());
+                    alive_.push_back(1);
+                    slots_[slot] = static_cast<uint32_t>(index);
+                    ++live_size_;
+                    return {iterator(this, index), true};
                 }
-                const size_t index = entries_.size();
-                entries_.emplace_back(std::move(state), make_record());
-                alive_.push_back(1);
-                slots_[slot] = static_cast<uint32_t>(index);
-                ++live_size_;
-                return {iterator(this, index), true};
-            }
-            if (entry == DELETED) {
-                if (first_deleted == std::numeric_limits<size_t>::max()) {
-                    first_deleted = slot;
+                if (entry == DELETED) {
+                    if (first_deleted == std::numeric_limits<size_t>::max()) {
+                        first_deleted = slot;
+                    }
+                } else if (alive_[entry] && entries_[entry].first == state) {
+                    return {iterator(this, entry), false};
                 }
-            } else if (alive_[entry] && entries_[entry].first == state) {
-                return {iterator(this, entry), false};
+                slot = (slot + 1) & mask;
             }
-            slot = (slot + 1) & mask;
         }
+    }
+
+    // After duplicate merging, the layer is only pruned and iterated. Release
+    // its lookup index before allocating dominance scratch space. find() has
+    // a linear fallback, and a later insertion rebuilds the index if needed.
+    void discard_lookup_index() {
+        // Keep small indexes: freeing them early perturbs allocator reuse more
+        // than their cheap erasures save. Release indexes of at least 64 KiB.
+        if (slots_.size() < 16384) return;
+        std::vector<uint32_t>{}.swap(slots_);
+        used_slots_ = 0;
+        deleted_slots_ = 0;
     }
 
     void erase(iterator where) {
         const size_t entry_index = where.index_;
         if (entry_index >= entries_.size() || !alive_[entry_index]) return;
-        const size_t mask = slots_.size() - 1;
-        size_t slot = StateHash{}(entries_[entry_index].first) & mask;
-        while (slots_[slot] != EMPTY) {
-            if (slots_[slot] == entry_index) {
-                slots_[slot] = DELETED;
-                ++deleted_slots_;
-                alive_[entry_index] = 0;
-                --live_size_;
-                // Inline words occupy the dense slot regardless, but release
-                // any wide-board overflow allocations immediately.
-                release_factor_storage(entries_[entry_index].first.hits);
-                if constexpr (TrackChosen) {
-                    if (entries_[entry_index].second.chosen.size() > Bits::INLINE_WORDS) {
-                        entries_[entry_index].second.chosen = Bits{};
-                    }
+        if (!slots_.empty()) {
+            const size_t mask = slots_.size() - 1;
+            size_t slot = StateHash{}(entries_[entry_index].first) & mask;
+            while (slots_[slot] != EMPTY) {
+                if (slots_[slot] == entry_index) {
+                    slots_[slot] = DELETED;
+                    ++deleted_slots_;
+                    break;
                 }
-                return;
+                slot = (slot + 1) & mask;
             }
-            slot = (slot + 1) & mask;
+            if (slots_[slot] == EMPTY) {
+                throw std::logic_error("flat DP table lost an indexed state");
+            }
         }
-        throw std::logic_error("flat DP table lost an indexed state");
+        alive_[entry_index] = 0;
+        --live_size_;
+        // Inline words occupy the dense slot regardless, but release any
+        // wide-board overflow allocations immediately.
+        release_factor_storage(entries_[entry_index].first.hits);
+        if constexpr (TrackChosen) {
+            if (entries_[entry_index].second.chosen.size() > Bits::INLINE_WORDS) {
+                entries_[entry_index].second.chosen = Bits{};
+            }
+        }
     }
 
     void swap(FactorTable& other) noexcept {
@@ -2173,7 +2297,7 @@ private:
 
     void ensure_insert_capacity() {
         if (slots_.empty()) {
-            rehash(8);
+            reserve(live_size_ + 1);
         } else if ((used_slots_ + 1) * 4 > slots_.size() * 3) {
             rehash(slots_.size() * 2);
         }
@@ -2236,10 +2360,12 @@ static bool connectivity_coarsens(const std::vector<uint64_t>& coarse,
     constexpr size_t kInlineComponents = 64;
     if (coarse_count <= kInlineComponents && fine_count <= kInlineComponents) {
         std::array<uint64_t, kInlineComponents> eligible{};
-        uint64_t represented = 0;
-        for (size_t c = 0; c < coarse_count; ++c) {
-            uint64_t mask = 0;
-            for (size_t f = 0; f < fine_count; ++f) {
+        // A fine component without any containing coarse component makes
+        // matching impossible. Build one fine column at a time so this
+        // necessary condition can reject the pair before building the rest.
+        for (size_t f = 0; f < fine_count; ++f) {
+            bool represented = false;
+            for (size_t c = 0; c < coarse_count; ++c) {
                 bool subset = true;
                 for (size_t word = 0; word < signature_words; ++word) {
                     const uint64_t fine_word = fine[f * signature_words + word];
@@ -2249,14 +2375,13 @@ static bool connectivity_coarsens(const std::vector<uint64_t>& coarse,
                         break;
                     }
                 }
-                if (subset) mask |= uint64_t{1} << f;
+                if (subset) {
+                    eligible[c] |= uint64_t{1} << f;
+                    represented = true;
+                }
             }
-            eligible[c] = mask;
-            represented |= mask;
+            if (!represented) return false;
         }
-        const uint64_t all_fine = fine_count == 64
-            ? ~uint64_t{0} : ((uint64_t{1} << fine_count) - 1);
-        if (represented != all_fine) return false;
 
         std::array<int, kInlineComponents> fine_match;
         fine_match.fill(-1);
@@ -2446,22 +2571,38 @@ static size_t prune_dominated(FactorTable<FactorBits, TrackChosen>& table,
     // and coarsening dominance can then reuse one cached key and one sort per
     // union bucket instead of rebuilding and sorting the table twice.
     std::unordered_map<std::vector<uint64_t>, size_t, WordsHash> bucket_by_union;
-    bucket_by_union.reserve(connectivity_count);
+    std::unordered_map<uint64_t, size_t> bucket_by_word;
+    if (signature_words == 1) bucket_by_word.reserve(connectivity_count);
+    else bucket_by_union.reserve(connectivity_count);
     std::vector<Bucket> buckets;
     std::vector<size_t> connectivity_bucket(connectivity_count,
                                              std::numeric_limits<size_t>::max());
     for (uint32_t id = 0; id < connectivity_count; ++id) {
         if (state_counts[id] == 0) continue;
-        std::vector<uint64_t> combined(signature_words, 0);
         const auto& signature = connectivity_pool[id];
-        for (size_t offset = 0; offset < signature.size(); offset += signature_words) {
-            for (size_t word = 0; word < signature_words; ++word) {
-                combined[word] |= signature[offset + word];
+        size_t bucket;
+        bool new_bucket;
+        if (signature_words == 1) {
+            // A scalar key represents the same union without allocating a
+            // one-element vector for each signature. Assign bucket IDs in
+            // signature order, just as on the multiword path.
+            uint64_t combined = 0;
+            for (uint64_t component : signature) combined |= component;
+            const auto result = bucket_by_word.emplace(combined, buckets.size());
+            bucket = result.first->second;
+            new_bucket = result.second;
+        } else {
+            std::vector<uint64_t> combined(signature_words, 0);
+            for (size_t offset = 0; offset < signature.size(); offset += signature_words) {
+                for (size_t word = 0; word < signature_words; ++word) {
+                    combined[word] |= signature[offset + word];
+                }
             }
+            const auto result = bucket_by_union.emplace(std::move(combined), buckets.size());
+            bucket = result.first->second;
+            new_bucket = result.second;
         }
-        auto [where, inserted] = bucket_by_union.emplace(std::move(combined), buckets.size());
-        if (inserted) buckets.emplace_back();
-        const size_t bucket = where->second;
+        if (new_bucket) buckets.emplace_back();
         connectivity_bucket[id] = bucket;
         buckets[bucket].connectivity_ids.push_back(id);
     }
@@ -2514,13 +2655,29 @@ static size_t prune_dominated(FactorTable<FactorBits, TrackChosen>& table,
                   });
     }
 
-    std::vector<std::vector<CachedItem*>> survivors(connectivity_count);
+    // Each signature can retain at most its incoming state count. Give its
+    // survivor list a disjoint slice of one allocation instead of allocating
+    // a separate vector for every signature on every dominance pass. Appends
+    // preserve the same sorted witness order and pointers stay stable.
+    struct SurvivorList {
+        CachedItem** data = nullptr;
+        size_t count = 0;
+        bool empty() const { return count == 0; }
+        CachedItem** begin() const { return data; }
+        CachedItem** end() const { return data + count; }
+        CachedItem* front() const { return data[0]; }
+        CachedItem* back() const { return data[count - 1]; }
+        void push_back(CachedItem* item) { data[count++] = item; }
+    };
+    std::vector<CachedItem*> survivor_storage(table.size());
+    std::vector<SurvivorList> survivors(connectivity_count);
     std::vector<int> minimum_quasi(connectivity_count, std::numeric_limits<int>::max());
     std::vector<int> maximum_quasi(connectivity_count, std::numeric_limits<int>::min());
     std::vector<int> minimum_cost(connectivity_count, std::numeric_limits<int>::max());
-    std::vector<int> maximum_cost(connectivity_count, std::numeric_limits<int>::min());
+    size_t survivor_offset = 0;
     for (uint32_t id = 0; id < connectivity_count; ++id) {
-        survivors[id].reserve(state_counts[id]);
+        survivors[id].data = survivor_storage.data() + survivor_offset;
+        survivor_offset += state_counts[id];
     }
     auto dominates = [&](const CachedItem* candidate, const CachedItem* target) {
         const int allowance = target->item->second.cost - candidate->item->second.cost;
@@ -2560,22 +2717,29 @@ static size_t prune_dominated(FactorTable<FactorBits, TrackChosen>& table,
                     std::max(maximum_quasi[connectivity_id], cached.quasi_score);
                 minimum_cost[connectivity_id] =
                     std::min(minimum_cost[connectivity_id], cached.item->second.cost);
-                maximum_cost[connectivity_id] =
-                    std::max(maximum_cost[connectivity_id], cached.item->second.cost);
             }
         }
     }
     const auto exact_end = profile ? std::chrono::steady_clock::now() : setup_end;
 
     std::vector<size_t> component_counts(connectivity_count, 0);
-    std::vector<std::vector<int>> component_populations(connectivity_count);
+    // Prefix offsets give each live signature a disjoint slice. Build the
+    // populations in one allocation rather than growing one vector per ID.
+    std::vector<size_t> population_offsets(connectivity_count + 1, 0);
+    for (uint32_t id = 0; id < connectivity_count; ++id) {
+        if (!survivors[id].empty()) {
+            component_counts[id] = connectivity_pool[id].size() / signature_words;
+        }
+        population_offsets[id + 1] = population_offsets[id] + component_counts[id];
+    }
+    std::vector<int> component_populations(population_offsets.back());
     std::vector<int> minimum_component_population(connectivity_count,
                                                    std::numeric_limits<int>::max());
     std::vector<int> maximum_component_population(connectivity_count, 0);
     for (uint32_t id = 0; id < connectivity_count; ++id) {
         if (!survivors[id].empty()) {
             const auto& signature = connectivity_pool[id];
-            component_counts[id] = signature.size() / signature_words;
+            size_t population_index = population_offsets[id];
             for (size_t offset = 0; offset < signature.size(); offset += signature_words) {
                 int population = 0;
                 for (size_t word = 0; word < signature_words; ++word) {
@@ -2585,9 +2749,10 @@ static size_t prune_dominated(FactorTable<FactorBits, TrackChosen>& table,
                     std::min(minimum_component_population[id], population);
                 maximum_component_population[id] =
                     std::max(maximum_component_population[id], population);
-                component_populations[id].push_back(population);
+                component_populations[population_index++] = population;
             }
-            std::sort(component_populations[id].begin(), component_populations[id].end());
+            std::sort(component_populations.begin() + population_offsets[id],
+                      component_populations.begin() + population_offsets[id + 1]);
         }
     }
 
@@ -2633,8 +2798,8 @@ static size_t prune_dominated(FactorTable<FactorBits, TrackChosen>& table,
             bool population_matching_possible = true;
             for (size_t component = 0; component < component_counts[coarse_id];
                  ++component) {
-                if (component_populations[fine_id][component] >
-                    component_populations[coarse_id][component]) {
+                if (component_populations[population_offsets[fine_id] + component] >
+                    component_populations[population_offsets[coarse_id] + component]) {
                     population_matching_possible = false;
                     break;
                 }
@@ -2688,8 +2853,29 @@ static size_t prune_dominated(FactorTable<FactorBits, TrackChosen>& table,
     // a common merge bounds the extra seeds even for incomparable signatures.
     // Run this after coarsening dominance so already-dominated targets can
     // skip these more expensive comparisons.
+    std::vector<CachedItem*> live_targets;
     for (uint32_t target_id = 0; target_id < connectivity_count; ++target_id) {
         if (survivors[target_id].empty()) continue;
+        live_targets.assign(survivors[target_id].begin(), survivors[target_id].end());
+        int live_maximum_cost;
+        int live_maximum_quasi;
+        auto refresh_targets = [&]() {
+            live_maximum_cost = std::numeric_limits<int>::min();
+            live_maximum_quasi = std::numeric_limits<int>::min();
+            size_t kept = 0;
+            for (CachedItem* target : live_targets) {
+                if (target->cross_dominated) continue;
+                live_targets[kept++] = target;
+                live_maximum_cost = std::max(live_maximum_cost, target->item->second.cost);
+                live_maximum_quasi = std::max(live_maximum_quasi, target->quasi_score);
+            }
+            live_targets.resize(kept);
+        };
+        // Forward dominance and earlier compensated witnesses can exhaust a
+        // target signature. Keep witnesses in survivors, but bound and scan
+        // only the remaining targets. Stable compaction preserves key order.
+        refresh_targets();
+        if (live_targets.empty()) continue;
         const auto& bucket = buckets[connectivity_bucket[target_id]];
         for (uint32_t candidate_id : bucket.connectivity_ids) {
             if (candidate_id == target_id || survivors[candidate_id].empty()) continue;
@@ -2698,8 +2884,8 @@ static size_t prune_dominated(FactorTable<FactorBits, TrackChosen>& table,
             int extra_seeds = std::max(1,
                 static_cast<int>(component_counts[candidate_id]) -
                 static_cast<int>(component_counts[target_id]));
-            if (minimum_cost[candidate_id] + extra_seeds > maximum_cost[target_id] ||
-                minimum_quasi[candidate_id] + extra_seeds > maximum_quasi[target_id]) {
+            if (minimum_cost[candidate_id] + extra_seeds > live_maximum_cost ||
+                minimum_quasi[candidate_id] + extra_seeds > live_maximum_quasi) {
                 continue;
             }
             // The high half of the key orders cost + active 3BV hits.
@@ -2708,7 +2894,7 @@ static size_t prune_dominated(FactorTable<FactorBits, TrackChosen>& table,
             // Use 64-bit arithmetic on the biased primary to avoid carry
             // between the two packed fields of DominanceKey.
             const uint64_t minimum_primary = survivors[candidate_id].front()->key.first >> 32;
-            const uint64_t maximum_primary = survivors[target_id].back()->key.first >> 32;
+            const uint64_t maximum_primary = live_targets.back()->key.first >> 32;
             if (minimum_primary + static_cast<uint64_t>(extra_seeds) > maximum_primary)
                 continue;
             if (!connectivity_exact_quotient(connectivity_pool[target_id],
@@ -2719,8 +2905,8 @@ static size_t prune_dominated(FactorTable<FactorBits, TrackChosen>& table,
                     signature_words);
                 if (extra_seeds <= 0 ||
                     extra_seeds == std::numeric_limits<int>::max() ||
-                    minimum_cost[candidate_id] + extra_seeds > maximum_cost[target_id] ||
-                    minimum_quasi[candidate_id] + extra_seeds > maximum_quasi[target_id]) {
+                    minimum_cost[candidate_id] + extra_seeds > live_maximum_cost ||
+                    minimum_quasi[candidate_id] + extra_seeds > live_maximum_quasi) {
                     continue;
                 }
                 if (minimum_primary + static_cast<uint64_t>(extra_seeds) > maximum_primary)
@@ -2728,8 +2914,8 @@ static size_t prune_dominated(FactorTable<FactorBits, TrackChosen>& table,
             }
             const auto& candidates = survivors[candidate_id];
             auto eligible_end = candidates.begin();
-            for (CachedItem* target : survivors[target_id]) {
-                if (target->cross_dominated) continue;
+            bool removed_target = false;
+            for (CachedItem* target : live_targets) {
                 const uint64_t target_primary = target->key.first >> 32;
                 // Both lists have ascending primary keys. Advance the
                 // affordable prefix once across all targets for this pair
@@ -2755,10 +2941,15 @@ static size_t prune_dominated(FactorTable<FactorBits, TrackChosen>& table,
                             candidate->item->first.hits, target->item->first.hits,
                             base_mask, allowance)) {
                         target->cross_dominated = true;
+                        removed_target = true;
                         if (profile) ++profile->reverse_pruned;
                         break;
                     }
                 }
+            }
+            if (removed_target) {
+                refresh_targets();
+                if (live_targets.empty()) break;
             }
         }
     }
@@ -3118,7 +3309,10 @@ static Solution solve_frontier_core(const Model& original_model,
             std::vector<uint64_t> merged(signature_words);
             std::vector<uint64_t> projected(signature_words);
             std::vector<uint64_t> canonical;
-            std::vector<uint8_t> absorption_removed;
+            // Generation stamps avoid clearing one byte per component for
+            // every successor considered during opening-chain absorption.
+            std::vector<uint32_t> absorption_marks;
+            uint32_t absorption_generation = 0;
             for (const auto& [old_state, old_record] : table) {
                 if (!connectivity_ready[old_state.connectivity_id]) {
                     const auto& old_signature = connectivity_pool[old_state.connectivity_id];
@@ -3127,6 +3321,35 @@ static Solution solve_frontier_core(const Model& original_model,
                         int closed = 0;
                         outgoing_words.clear();
                         outgoing_offsets.clear();
+                        if (signature_words == 1) {
+                            // Work directly on component words: no projection
+                            // buffer, offset list, or per-word loops are needed.
+                            const uint64_t current_bit = current_connectivity_slot >= 0
+                                ? uint64_t{1} << current_connectivity_slot : 0;
+                            uint64_t merged_word = selected
+                                ? (compact_connectivity ? compact_future_neighbors[i][0]
+                                                        : future_neighbors[i][0])
+                                : 0;
+                            outgoing_words.reserve(old_signature.size() + selected);
+                            for (uint64_t component : old_signature) {
+                                const uint64_t remaining = component & ~current_bit;
+                                if (selected && (component & current_bit)) {
+                                    merged_word |= remaining;
+                                } else if (remaining) {
+                                    outgoing_words.push_back(remaining);
+                                } else {
+                                    ++closed;
+                                }
+                            }
+                            if (selected) {
+                                if (merged_word) outgoing_words.push_back(merged_word);
+                                else ++closed;
+                            }
+                            std::sort(outgoing_words.begin(), outgoing_words.end());
+                            computed[selected] = {
+                                next_connectivity_pool.intern(outgoing_words), closed};
+                            continue;
+                        }
                         std::fill(merged.begin(), merged.end(), 0);
                         const size_t old_component_count =
                             old_signature.size() / signature_words;
@@ -3277,37 +3500,73 @@ static Solution solve_frontier_core(const Model& original_model,
                     if (connectivity_id != 0 && !opening_patterns[i].empty()) {
                         const auto& signature = next_connectivity_pool[connectivity_id];
                         const size_t component_count = signature.size() / signature_words;
-                        absorption_removed.assign(component_count, 0);
+                        if (absorption_marks.size() < component_count)
+                            absorption_marks.resize(component_count, 0);
+                        if (absorption_generation == std::numeric_limits<uint32_t>::max()) {
+                            std::fill(absorption_marks.begin(), absorption_marks.end(), 0);
+                            absorption_generation = 1;
+                        } else {
+                            ++absorption_generation;
+                        }
                         bool changed = false;
                         for (const OpeningPattern& opening : opening_patterns[i]) {
                             if (!Ops::test(new_hits, opening.factor_slot)) continue;
-                            for (size_t component = 0; component < component_count;
-                                 ++component) {
-                                if (absorption_removed[component]) continue;
-                                const size_t offset = component * signature_words;
-                                bool equal = true;
-                                for (size_t word = 0; word < signature_words; ++word) {
-                                    if (signature[offset + word] !=
-                                        opening.remaining_border[word]) {
-                                        equal = false;
+                            size_t matched_component = component_count;
+                            if (signature_words == 1) {
+                                // One-word signatures are sorted by component
+                                // value. Find the first matching component
+                                // directly instead of rescanning the frontier.
+                                const auto match = std::lower_bound(
+                                    signature.begin(), signature.end(),
+                                    opening.remaining_border[0]);
+                                if (match != signature.end() &&
+                                    *match == opening.remaining_border[0]) {
+                                    matched_component = static_cast<size_t>(
+                                        match - signature.begin());
+                                    while (matched_component < component_count &&
+                                           absorption_marks[matched_component] == absorption_generation &&
+                                           signature[matched_component] ==
+                                               opening.remaining_border[0]) {
+                                        ++matched_component;
+                                    }
+                                    if (matched_component == component_count ||
+                                        signature[matched_component] !=
+                                            opening.remaining_border[0]) {
+                                        matched_component = component_count;
+                                    }
+                                }
+                            } else {
+                                for (size_t component = 0; component < component_count;
+                                     ++component) {
+                                    if (absorption_marks[component] == absorption_generation) continue;
+                                    const size_t offset = component * signature_words;
+                                    bool equal = true;
+                                    for (size_t word = 0; word < signature_words; ++word) {
+                                        if (signature[offset + word] !=
+                                            opening.remaining_border[word]) {
+                                            equal = false;
+                                            break;
+                                        }
+                                    }
+                                    if (equal) {
+                                        matched_component = component;
                                         break;
                                     }
                                 }
-                                if (!equal) continue;
-                                absorption_removed[component] = 1;
-                                Ops::clear(new_hits, opening.factor_slot);
-                                ++new_cost;
-                                ++opening_absorptions;
-                                changed = true;
-                                break;
                             }
+                            if (matched_component == component_count) continue;
+                            absorption_marks[matched_component] = absorption_generation;
+                            Ops::clear(new_hits, opening.factor_slot);
+                            ++new_cost;
+                            ++opening_absorptions;
+                            changed = true;
                         }
                         if (changed) {
                             canonical.clear();
                             canonical.reserve(signature.size());
                             for (size_t component = 0; component < component_count;
                                  ++component) {
-                                if (absorption_removed[component]) continue;
+                                if (absorption_marks[component] == absorption_generation) continue;
                                 const size_t offset = component * signature_words;
                                 canonical.insert(canonical.end(),
                                     signature.begin() + static_cast<std::ptrdiff_t>(offset),
@@ -3318,10 +3577,12 @@ static Solution solve_frontier_core(const Model& original_model,
                         }
                     }
                     StateType state{connectivity_id, std::move(new_hits)};
+                    Bits old_chosen{};
+                    if constexpr (TrackChosen) old_chosen = old_record.chosen;
                     auto [found, inserted] = next.find_or_emplace(
                         std::move(state), [&]() {
                         if constexpr (TrackChosen) {
-                            Bits new_chosen = old_record.chosen;
+                            Bits new_chosen = old_chosen;
                             if (selected) set_bit(new_chosen, i);
                             return Record<true>{new_cost, std::move(new_chosen)};
                         } else {
@@ -3331,13 +3592,15 @@ static Solution solve_frontier_core(const Model& original_model,
                     if (!inserted && new_cost < found->second.cost) {
                         found->second.cost = new_cost;
                         if constexpr (TrackChosen) {
-                            found->second.chosen = old_record.chosen;
+                            found->second.chosen = old_chosen;
                             if (selected) set_bit(found->second.chosen, i);
                         }
                     }
                 }
             }
         }
+
+        next.discard_lookup_index();
 
         // The previous layer and connectivity pool are no longer needed. Release
         // them before dominance pruning so they do not overlap the largest
@@ -3808,6 +4071,8 @@ static void print_click_tuples(const Model& model, const Solution& solution) {
 }
 
 struct Options {
+    bool benchmark = false;
+    bool benchmark_multi = false;
     std::optional<std::string> board;
     std::optional<std::string> generate;
     std::optional<std::string> bulk;
@@ -3830,6 +4095,8 @@ static void print_help(const char* program) {
         << "BOARD may be a PTTACG string, compatible LlamaSweeper URL,\n"
         << "World of Minesweeper game URL, MBF filename, or quoted MBF hex.\n\n"
         << "Options:\n"
+        << "  --benchmark                    Three fixed 1000-board Expert runs, one thread; validate counts\n"
+        << "  --benchmark-multi              Same fixed benchmark using multiple threads\n"
         << "  --generate beginner|intermediate|expert\n"
         << "                                 Generate, print, and solve one random board\n"
         << "  --bulk beginner|intermediate|expert COUNT\n"
@@ -3886,7 +4153,12 @@ static Options parse_options(int argc, char** argv) {
         if (arg == "-h" || arg == "--help") {
             print_help(argv[0]);
             std::exit(0);
-        } else if (arg == "--generate") options.generate = value_after(i, arg);
+        } else if (arg == "--benchmark") options.benchmark = true;
+        else if (arg == "--benchmark-multi") {
+            options.benchmark = true;
+            options.benchmark_multi = true;
+        }
+        else if (arg == "--generate") options.generate = value_after(i, arg);
         else if (arg == "--bulk") {
             options.bulk = value_after(i, arg);
             options.bulk_count = parse_positive_size(value_after(i, arg), arg);
@@ -3909,6 +4181,15 @@ static Options parse_options(int argc, char** argv) {
         return difficulty == "beginner" || difficulty == "intermediate" ||
                difficulty == "expert";
     };
+    if (options.benchmark) {
+        if (options.board || options.generate || options.bulk || options.seed ||
+            (options.threads && !options.benchmark_multi) || options.json || options.click_tuples || options.profile ||
+            (options.count_only && !*options.count_only)) {
+            throw UserError("benchmark modes use fixed seeds, Expert boards, and count-only output; "
+                            "cannot combine with BOARD, --generate, --bulk, --seed, incompatible --threads, "
+                            "--json, --click-tuples, --profile, or --no-count-only");
+        }
+    }
     if (options.generate && options.bulk) {
         throw UserError("choose only one of --generate and --bulk");
     }
@@ -3926,7 +4207,7 @@ static Options parse_options(int argc, char** argv) {
             throw UserError("--generate must be beginner, intermediate, or expert");
         }
         if (options.board) throw UserError("do not supply a board argument with --generate");
-    } else {
+    } else if (!options.benchmark) {
         if (!options.board) throw UserError("a board argument, --generate, or --bulk is required");
         if (options.seed) throw UserError("--seed requires --generate or --bulk");
     }
@@ -3936,16 +4217,214 @@ static Options parse_options(int argc, char** argv) {
         throw UserError("--band-size requires a plain row or column --order (or auto)");
     }
     if (options.json && options.click_tuples) throw UserError("choose only one of --json and --click-tuples");
-    if (options.threads && !options.bulk) throw UserError("--threads requires --bulk");
+    if (options.threads && !options.bulk && !options.benchmark_multi)
+        throw UserError("--threads requires --bulk or --benchmark-multi");
     if (options.click_tuples && options.count_only.value_or(false)) {
         throw UserError("--click-tuples requires --no-count-only");
     }
     return options;
 }
 
+// Input must already be sorted. Match the bulk runner's interpolated percentiles.
+static double benchmark_percentile(const std::vector<double>& sorted, double p) {
+    const double rank = p * static_cast<double>(sorted.size() - 1);
+    const size_t lower = static_cast<size_t>(rank);
+    const size_t upper = std::min(lower + 1, sorted.size() - 1);
+    const double fraction = rank - static_cast<double>(lower);
+    return sorted[lower] * (1.0 - fraction) + sorted[upper] * fraction;
+}
+
+struct BenchmarkReference {
+    std::string board;
+    int three_bv;
+    int clicks;
+};
+
+static std::array<std::vector<BenchmarkReference>, 3> load_benchmark_references() {
+    std::ifstream input(expert_benchmark::reference_csv);
+    if (!input) throw UserError("cannot open benchmark references: " +
+                                std::string(expert_benchmark::reference_csv));
+    std::string line;
+    if (!std::getline(input, line) || line != "run,seed,board,three_bv,clicks")
+        throw UserError("invalid benchmark reference CSV header");
+
+    std::array<std::vector<BenchmarkReference>, 3> references;
+    for (auto& run : references) run.reserve(expert_benchmark::board_count);
+    size_t line_number = 1;
+    while (std::getline(input, line)) {
+        ++line_number;
+        std::array<std::string, 5> fields;
+        size_t start = 0;
+        for (size_t field = 0; field < fields.size(); ++field) {
+            const size_t comma = line.find(',', start);
+            if (field + 1 < fields.size() && comma == std::string::npos)
+                throw UserError("invalid benchmark reference CSV row " + std::to_string(line_number));
+            if (field + 1 == fields.size() && comma != std::string::npos)
+                throw UserError("invalid benchmark reference CSV row " + std::to_string(line_number));
+            fields[field] = line.substr(start, comma == std::string::npos ? comma : comma - start);
+            start = comma == std::string::npos ? line.size() : comma + 1;
+        }
+        try {
+            const size_t run = static_cast<size_t>(std::stoul(fields[0]));
+            const uint64_t seed = std::stoull(fields[1]);
+            const int three_bv = std::stoi(fields[3]);
+            const int clicks = std::stoi(fields[4]);
+            if (run < 1 || run > references.size() ||
+                seed != expert_benchmark::seeds[run - 1] || fields[2].empty() ||
+                fields[2].find('"') != std::string::npos)
+                throw std::runtime_error("invalid values");
+            references[run - 1].push_back({fields[2], three_bv, clicks});
+        } catch (const std::exception&) {
+            throw UserError("invalid benchmark reference CSV row " + std::to_string(line_number));
+        }
+        if (references[0].size() > expert_benchmark::board_count ||
+            references[1].size() > expert_benchmark::board_count ||
+            references[2].size() > expert_benchmark::board_count)
+            throw UserError("too many rows in benchmark reference CSV");
+    }
+    for (const auto& run : references)
+        if (run.size() != expert_benchmark::board_count)
+            throw UserError("benchmark reference CSV must contain 1000 boards for each seed");
+    return references;
+}
+
+static void validate_benchmark_result(size_t run, size_t index, const std::string& encoded,
+                                      int three_bv, int clicks,
+                                      const std::array<std::vector<BenchmarkReference>, 3>& references) {
+    const auto& expected = references[run][index];
+    if (encoded != expected.board || three_bv != expected.three_bv || clicks != expected.clicks) {
+        throw UserError("benchmark validation failed: run " + std::to_string(run + 1) +
+                        ", seed " + std::to_string(expert_benchmark::seeds[run]) +
+                        ", board " + std::to_string(index + 1) +
+                        "; expected " + expected.board + " (3BV " +
+                        std::to_string(expected.three_bv) + ", clicks " +
+                        std::to_string(expected.clicks) + "), got " + encoded +
+                        " (3BV " + std::to_string(three_bv) + ", clicks " +
+                        std::to_string(clicks) + ")");
+    }
+}
+
+static void run_benchmark(const Options& options) {
+    const auto references = load_benchmark_references();
+    if (options.benchmark_multi) {
+        const unsigned detected = std::thread::hardware_concurrency();
+        const size_t workers = std::min(expert_benchmark::board_count,
+            options.threads.value_or(detected ? detected : 1));
+        std::cout << "Expert benchmark: 3 runs x 1000 boards; " << workers
+                  << " worker thread(s); count-only\n"
+                  << "Per-board times include model construction and solving; "
+                     "percentiles use linear interpolation.\n"
+                  << "run,seed,boards,threads,total_seconds,median_seconds,p5_seconds,p95_seconds,validation\n";
+        for (size_t run = 0; run < expert_benchmark::seeds.size(); ++run) {
+            struct Job {
+                Board board;
+                std::string encoded;
+                double seconds = 0.0;
+                std::string error;
+            };
+            const auto start = std::chrono::steady_clock::now();
+            std::mt19937_64 rng(expert_benchmark::seeds[run]);
+            std::vector<Job> jobs(expert_benchmark::board_count);
+            for (auto& job : jobs) {
+                job.board = generate_standard_board("expert", rng);
+                job.encoded = format_pttacg_string(job.board);
+            }
+            std::atomic<size_t> next{0};
+            auto work = [&] {
+                for (;;) {
+                    const size_t index = next.fetch_add(1, std::memory_order_relaxed);
+                    if (index >= jobs.size()) break;
+                    auto& job = jobs[index];
+                    try {
+                        const auto solve_start = std::chrono::steady_clock::now();
+                        Model model = build_model(job.board);
+                        Solution solution = solve_frontier(
+                            model, options.order, options.band_size, false, true);
+                        const auto solve_end = std::chrono::steady_clock::now();
+                        validate_benchmark_result(run, index, job.encoded, model.three_bv(),
+                                                  solution.clicks, references);
+                        job.seconds = std::chrono::duration<double>(solve_end - solve_start).count();
+                    } catch (const std::exception& error) {
+                        job.error = error.what();
+                    }
+                }
+            };
+            if (workers == 1) work();
+            else {
+                std::vector<std::thread> pool;
+                pool.reserve(workers);
+                for (size_t t = 0; t < workers; ++t) pool.emplace_back(work);
+                for (auto& thread : pool) thread.join();
+            }
+            std::vector<double> solve_times;
+            solve_times.reserve(jobs.size());
+            for (size_t index = 0; index < jobs.size(); ++index) {
+                if (!jobs[index].error.empty())
+                    throw UserError("benchmark run " + std::to_string(run + 1) + ", board " +
+                                    std::to_string(index + 1) + " failed: " + jobs[index].error);
+                solve_times.push_back(jobs[index].seconds);
+                if (options.progress && ((index + 1) % 100 == 0))
+                    std::cerr << "Benchmark run " << run + 1 << "/3, seed "
+                              << expert_benchmark::seeds[run] << ": " << index + 1
+                              << "/1000 boards validated\n";
+            }
+            const double total = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - start).count();
+            std::sort(solve_times.begin(), solve_times.end());
+            std::cout << run + 1 << ',' << expert_benchmark::seeds[run] << ','
+                      << solve_times.size() << ',' << workers << ','
+                      << std::fixed << std::setprecision(6) << total << ','
+                      << benchmark_percentile(solve_times, 0.50) << ','
+                      << benchmark_percentile(solve_times, 0.05) << ','
+                      << benchmark_percentile(solve_times, 0.95) << ",PASS\n" << std::flush;
+        }
+        std::cout << "Validated all 3000 boards against fixed board, 3BV, and optimal-click references.\n";
+        return;
+    }
+    std::cout << "Expert benchmark: 3 runs x 1000 boards; single thread; count-only\n"
+              << "Per-board times include model construction and solving; "
+                 "percentiles use linear interpolation.\n"
+              << "run,seed,boards,total_seconds,median_seconds,p5_seconds,p95_seconds,validation\n";
+    for (size_t run = 0; run < expert_benchmark::seeds.size(); ++run) {
+        const uint64_t seed = expert_benchmark::seeds[run];
+        std::mt19937_64 rng(seed);
+        std::vector<double> solve_times;
+        solve_times.reserve(expert_benchmark::board_count);
+        const auto start = std::chrono::steady_clock::now();
+        // Intentionally execute directly on this thread, without a worker pool.
+        for (size_t index = 0; index < expert_benchmark::board_count; ++index) {
+            Board board = generate_standard_board("expert", rng);
+            const std::string encoded = format_pttacg_string(board);
+            const auto solve_start = std::chrono::steady_clock::now();
+            Model model = build_model(board);
+            Solution solution = solve_frontier(model, options.order, options.band_size, false, true);
+            const auto solve_end = std::chrono::steady_clock::now();
+            validate_benchmark_result(run, index, encoded, model.three_bv(), solution.clicks, references);
+            solve_times.push_back(std::chrono::duration<double>(solve_end - solve_start).count());
+            if (options.progress && ((index + 1) % 100 == 0)) {
+                std::cerr << "Benchmark run " << run + 1 << "/3, seed " << seed
+                          << ": " << index + 1 << "/1000 boards validated\n";
+            }
+        }
+        const double total = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - start).count();
+        std::sort(solve_times.begin(), solve_times.end());
+        std::cout << run + 1 << ',' << seed << ',' << solve_times.size() << ','
+                  << std::fixed << std::setprecision(6) << total << ','
+                  << benchmark_percentile(solve_times, 0.50) << ','
+                  << benchmark_percentile(solve_times, 0.05) << ','
+                  << benchmark_percentile(solve_times, 0.95) << ",PASS\n" << std::flush;
+    }
+    std::cout << "Validated all 3000 boards against fixed board, 3BV, and optimal-click references.\n";
+}
+
 int main(int argc, char** argv) {
     try {
         const Options options = parse_options(argc, argv);
+        if (options.benchmark) {
+            run_benchmark(options);
+            return 0;
+        }
         if (options.bulk) {
             const uint64_t master_seed = options.seed.value_or(random_seed());
             std::mt19937_64 rng(master_seed);
@@ -3956,8 +4435,10 @@ int main(int argc, char** argv) {
             std::cerr << "Bulk RNG: std::mt19937_64; seed: " << master_seed << "\n";
             std::cerr << "Bulk workers: " << workers << "; "
                       << (count_only ? "count-only" : "full replay") << " mode\n";
-            std::cout << "board,3bv,optimal_clicks\n";
+            std::cout << "board,3bv,optimal_clicks,solve_seconds\n";
             const auto bulk_start = std::chrono::steady_clock::now();
+            std::vector<double> solve_times;
+            solve_times.reserve(options.bulk_count);
             // Bound outstanding boards/results while generating every board on the
             // main thread. This preserves the seeded sequence and CSV row order.
             for (size_t begin = 0; begin < options.bulk_count;) {
@@ -3968,6 +4449,7 @@ int main(int argc, char** argv) {
                     std::string encoded;
                     int three_bv = 0;
                     int clicks = 0;
+                    double solve_seconds = 0.0;
                     std::string error;
                 };
                 std::vector<Job> jobs(batch);
@@ -3981,11 +4463,15 @@ int main(int argc, char** argv) {
                         const size_t j = next.fetch_add(1, std::memory_order_relaxed);
                         if (j >= batch) break;
                         try {
+                            const auto solve_start = std::chrono::steady_clock::now();
                             Model model = build_model(jobs[j].board);
                             Solution solution = solve_frontier(
                                 model, options.order, options.band_size, false, count_only);
+                            const auto solve_end = std::chrono::steady_clock::now();
                             jobs[j].three_bv = model.three_bv();
                             jobs[j].clicks = solution.clicks;
+                            jobs[j].solve_seconds = std::chrono::duration<double>(
+                                solve_end - solve_start).count();
                         } catch (const std::exception& error) {
                             jobs[j].error = error.what();
                         }
@@ -4011,7 +4497,9 @@ int main(int argc, char** argv) {
                                   << ": " << job.encoded << " => " << job.clicks << " clicks\n";
                     }
                     std::cout << '"' << job.encoded << "\"," << job.three_bv << ','
-                              << job.clicks << '\n';
+                              << job.clicks << ',' << std::fixed << std::setprecision(6)
+                              << job.solve_seconds << '\n';
+                    solve_times.push_back(job.solve_seconds);
                 }
                 begin += batch;
             }
@@ -4020,6 +4508,18 @@ int main(int argc, char** argv) {
                 std::chrono::duration<double>(bulk_end - bulk_start).count();
             std::cerr << "Bulk solve time: " << std::fixed << std::setprecision(3)
                       << seconds << " seconds\n";
+            std::sort(solve_times.begin(), solve_times.end());
+            const auto percentile = [&](double p) {
+                const double rank = p * static_cast<double>(solve_times.size() - 1);
+                const size_t lower = static_cast<size_t>(rank);
+                const size_t upper = std::min(lower + 1, solve_times.size() - 1);
+                const double fraction = rank - static_cast<double>(lower);
+                return solve_times[lower] * (1.0 - fraction) + solve_times[upper] * fraction;
+            };
+            std::cerr << "Per-board solve time (seconds, linear interpolation): median "
+                      << std::fixed << std::setprecision(6) << percentile(0.50)
+                      << ", p5 " << percentile(0.05)
+                      << ", p95 " << percentile(0.95) << "\n";
             return 0;
         }
         Board board;
