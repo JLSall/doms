@@ -48,7 +48,6 @@ namespace fs = std::filesystem;
 
 constexpr std::string_view LLAMA_ALPHABET = "0123456789abcdefghijklmnopqrstuv";
 constexpr int PROGRESS_INTERVAL = 10;
-constexpr uint64_t DOMINANCE_COMPARISONS = 1'000'000;
 
 struct UserError : std::runtime_error {
     using std::runtime_error::runtime_error;
@@ -107,7 +106,6 @@ struct ProfileStats {
     double dominance_erase = 0.0;
     uint64_t processed_states = 0;
     uint64_t generated_states = 0;
-    uint64_t dominance_budget_exhausted = 0;
     uint64_t exact_pruned = 0;
     uint64_t forward_pruned = 0;
     uint64_t reverse_pruned = 0;
@@ -2413,12 +2411,11 @@ static int connectivity_merge_penalty(const std::vector<uint64_t>& a,
 
 template <typename FactorBits, bool TrackChosen>
 static size_t prune_dominated(FactorTable<FactorBits, TrackChosen>& table,
-                              uint64_t comparison_limit,
                               const FactorBits& base_mask,
                               const ConnectivityPool& connectivity_pool,
                               size_t signature_words,
                               ProfileStats* profile = nullptr) {
-    if (comparison_limit == 0 || table.size() < 2) return 0;
+    if (table.size() < 2) return 0;
     const auto profile_start = profile ? std::chrono::steady_clock::now() :
         std::chrono::steady_clock::time_point{};
     using Item = typename FactorTable<FactorBits, TrackChosen>::iterator;
@@ -2517,7 +2514,6 @@ static size_t prune_dominated(FactorTable<FactorBits, TrackChosen>& table,
                   });
     }
 
-    uint64_t remaining = comparison_limit;
     std::vector<std::vector<CachedItem*>> survivors(connectivity_count);
     std::vector<int> minimum_quasi(connectivity_count, std::numeric_limits<int>::max());
     std::vector<int> maximum_quasi(connectivity_count, std::numeric_limits<int>::min());
@@ -2548,13 +2544,10 @@ static size_t prune_dominated(FactorTable<FactorBits, TrackChosen>& table,
             const uint32_t connectivity_id = cached.item->first.connectivity_id;
             auto& kept = survivors[connectivity_id];
             bool is_dominated = false;
-            if (remaining >= kept.size()) {
-                remaining -= kept.size();
-                for (CachedItem* prior : kept) {
-                    if (dominates(prior, &cached)) {
-                        is_dominated = true;
-                        break;
-                    }
+            for (CachedItem* prior : kept) {
+                if (dominates(prior, &cached)) {
+                    is_dominated = true;
+                    break;
                 }
             }
             cached.exact_dominated = is_dominated;
@@ -2602,11 +2595,9 @@ static size_t prune_dominated(FactorTable<FactorBits, TrackChosen>& table,
     // cross-dominated states available as witnesses until the scan finishes,
     // matching the previous deferred-erasure behavior. Discover coarsening
     // relationships lazily: many signature pairs cannot have even one
-    // scalar-feasible dominance comparison, and later IDs need no work once
-    // the layer's comparison budget is exhausted.
+    // scalar-feasible dominance comparison.
     std::vector<uint32_t> coarser;
-    bool exhausted = false;
-    for (uint32_t fine_id = 0; fine_id < connectivity_count && !exhausted; ++fine_id) {
+    for (uint32_t fine_id = 0; fine_id < connectivity_count; ++fine_id) {
         if (survivors[fine_id].empty()) continue;
         coarser.clear();
         const auto& bucket = buckets[connectivity_bucket[fine_id]];
@@ -2678,21 +2669,15 @@ static size_t prune_dominated(FactorTable<FactorBits, TrackChosen>& table,
             for (uint32_t coarse_id : coarser) {
                 for (CachedItem* prior : survivors[coarse_id]) {
                     if (prior->key > cached->key) break;
-                    if (remaining == 0) {
-                        exhausted = true;
-                        break;
-                    }
-                    --remaining;
                     if (dominates(prior, cached)) {
                         is_dominated = true;
                         break;
                     }
                 }
-                if (is_dominated || exhausted) break;
+                if (is_dominated) break;
             }
             cached->cross_dominated = is_dominated;
             if (is_dominated && profile) ++profile->forward_pruned;
-            if (exhausted) break;
         }
     }
 
@@ -2701,94 +2686,83 @@ static size_t prune_dominated(FactorTable<FactorBits, TrackChosen>& table,
     // Cost-compensated connectivity dominance extends the reverse pass.
     // Exact quotients pay the difference in live component counts. Otherwise,
     // a common merge bounds the extra seeds even for incomparable signatures.
-    // Run this after the usual pass so its comparisons cannot displace the
-    // established coarsening checks within the layer's comparison budget.
-    if (!exhausted) {
-        for (uint32_t target_id = 0; target_id < connectivity_count && !exhausted;
-             ++target_id) {
-            if (survivors[target_id].empty()) continue;
-            const auto& bucket = buckets[connectivity_bucket[target_id]];
-            for (uint32_t candidate_id : bucket.connectivity_ids) {
-                if (candidate_id == target_id || survivors[candidate_id].empty()) continue;
-                // A positive compensation requires a strictly cheaper witness.
-                // This also prevents cycles of mutually deleted new witnesses.
-                int extra_seeds = std::max(1,
-                    static_cast<int>(component_counts[candidate_id]) -
-                    static_cast<int>(component_counts[target_id]));
-                if (minimum_cost[candidate_id] + extra_seeds > maximum_cost[target_id] ||
+    // Run this after coarsening dominance so already-dominated targets can
+    // skip these more expensive comparisons.
+    for (uint32_t target_id = 0; target_id < connectivity_count; ++target_id) {
+        if (survivors[target_id].empty()) continue;
+        const auto& bucket = buckets[connectivity_bucket[target_id]];
+        for (uint32_t candidate_id : bucket.connectivity_ids) {
+            if (candidate_id == target_id || survivors[candidate_id].empty()) continue;
+            // A positive compensation requires a strictly cheaper witness.
+            // This also prevents cycles of mutually deleted new witnesses.
+            int extra_seeds = std::max(1,
+                static_cast<int>(component_counts[candidate_id]) -
+                static_cast<int>(component_counts[target_id]));
+            if (minimum_cost[candidate_id] + extra_seeds > maximum_cost[target_id] ||
+                minimum_quasi[candidate_id] + extra_seeds > maximum_quasi[target_id]) {
+                continue;
+            }
+            // The high half of the key orders cost + active 3BV hits.
+            // The factor penalty is at least base_hits(A)-base_hits(B),
+            // so adding the seed charge still cannot exceed B's primary key.
+            // Use 64-bit arithmetic on the biased primary to avoid carry
+            // between the two packed fields of DominanceKey.
+            const uint64_t minimum_primary = survivors[candidate_id].front()->key.first >> 32;
+            const uint64_t maximum_primary = survivors[target_id].back()->key.first >> 32;
+            if (minimum_primary + static_cast<uint64_t>(extra_seeds) > maximum_primary)
+                continue;
+            if (!connectivity_exact_quotient(connectivity_pool[target_id],
+                                             connectivity_pool[candidate_id],
+                                             signature_words)) {
+                extra_seeds = connectivity_merge_penalty(
+                    connectivity_pool[candidate_id], connectivity_pool[target_id],
+                    signature_words);
+                if (extra_seeds <= 0 ||
+                    extra_seeds == std::numeric_limits<int>::max() ||
+                    minimum_cost[candidate_id] + extra_seeds > maximum_cost[target_id] ||
                     minimum_quasi[candidate_id] + extra_seeds > maximum_quasi[target_id]) {
                     continue;
                 }
-                // The high half of the key orders cost + active 3BV hits.
-                // The factor penalty is at least base_hits(A)-base_hits(B),
-                // so adding the seed charge still cannot exceed B's primary key.
-                // Use 64-bit arithmetic on the biased primary to avoid carry
-                // between the two packed fields of DominanceKey.
-                const uint64_t minimum_primary = survivors[candidate_id].front()->key.first >> 32;
-                const uint64_t maximum_primary = survivors[target_id].back()->key.first >> 32;
                 if (minimum_primary + static_cast<uint64_t>(extra_seeds) > maximum_primary)
                     continue;
-                if (!connectivity_exact_quotient(connectivity_pool[target_id],
-                                                 connectivity_pool[candidate_id],
-                                                 signature_words)) {
-                    extra_seeds = connectivity_merge_penalty(
-                        connectivity_pool[candidate_id], connectivity_pool[target_id],
-                        signature_words);
-                    if (extra_seeds <= 0 ||
-                        extra_seeds == std::numeric_limits<int>::max() ||
-                        minimum_cost[candidate_id] + extra_seeds > maximum_cost[target_id] ||
-                        minimum_quasi[candidate_id] + extra_seeds > maximum_quasi[target_id]) {
-                        continue;
-                    }
-                    if (minimum_primary + static_cast<uint64_t>(extra_seeds) > maximum_primary)
-                        continue;
+            }
+            const auto& candidates = survivors[candidate_id];
+            auto eligible_end = candidates.begin();
+            for (CachedItem* target : survivors[target_id]) {
+                if (target->cross_dominated) continue;
+                const uint64_t target_primary = target->key.first >> 32;
+                // Both lists have ascending primary keys. Advance the
+                // affordable prefix once across all targets for this pair
+                // of signatures, keeping the cutoff test out of the inner loop.
+                while (eligible_end != candidates.end() &&
+                       ((*eligible_end)->key.first >> 32) +
+                           static_cast<uint64_t>(extra_seeds) <= target_primary) {
+                    ++eligible_end;
                 }
-                const auto& candidates = survivors[candidate_id];
-                auto eligible_end = candidates.begin();
-                for (CachedItem* target : survivors[target_id]) {
-                    if (target->cross_dominated) continue;
-                    const uint64_t target_primary = target->key.first >> 32;
-                    // Both lists have ascending primary keys. Advance the
-                    // affordable prefix once across all targets for this pair
-                    // of signatures, keeping the cutoff test out of the inner loop.
-                    while (eligible_end != candidates.end() &&
-                           ((*eligible_end)->key.first >> 32) +
-                               static_cast<uint64_t>(extra_seeds) <= target_primary) {
-                        ++eligible_end;
+                for (auto candidate_it = candidates.begin(); candidate_it != eligible_end;
+                     ++candidate_it) {
+                    CachedItem* candidate = *candidate_it;
+                    if (candidate->item->second.cost + extra_seeds >
+                        target->item->second.cost) continue;
+                    if (candidate->quasi_score + extra_seeds > target->quasi_score)
+                        continue;
+                    const int allowance = target->item->second.cost -
+                        candidate->item->second.cost - extra_seeds;
+                    const int lower_bound =
+                        std::max(0, target->flag_hits - candidate->flag_hits) +
+                        std::max(0, candidate->base_hits - target->base_hits);
+                    if (lower_bound <= allowance && dominance_penalty_at_most(
+                            candidate->item->first.hits, target->item->first.hits,
+                            base_mask, allowance)) {
+                        target->cross_dominated = true;
+                        if (profile) ++profile->reverse_pruned;
+                        break;
                     }
-                    for (auto candidate_it = candidates.begin(); candidate_it != eligible_end;
-                         ++candidate_it) {
-                        CachedItem* candidate = *candidate_it;
-                        if (candidate->item->second.cost + extra_seeds >
-                            target->item->second.cost) continue;
-                        if (candidate->quasi_score + extra_seeds > target->quasi_score)
-                            continue;
-                        if (remaining == 0) {
-                            exhausted = true;
-                            break;
-                        }
-                        --remaining;
-                        const int allowance = target->item->second.cost -
-                            candidate->item->second.cost - extra_seeds;
-                        const int lower_bound =
-                            std::max(0, target->flag_hits - candidate->flag_hits) +
-                            std::max(0, candidate->base_hits - target->base_hits);
-                        if (lower_bound <= allowance && dominance_penalty_at_most(
-                                candidate->item->first.hits, target->item->first.hits,
-                                base_mask, allowance)) {
-                            target->cross_dominated = true;
-                            if (profile) ++profile->reverse_pruned;
-                            break;
-                        }
-                    }
-                    if (exhausted) break;
                 }
-                if (exhausted) break;
             }
         }
     }
     const auto cross_end = profile ? std::chrono::steady_clock::now() : exact_end;
-    if (exhausted && profile) ++profile->dominance_budget_exhausted;
 
     size_t removed = 0;
     for (auto& bucket : buckets) {
@@ -3390,7 +3364,7 @@ static Solution solve_frontier_core(const Model& original_model,
         const auto prune_start = profile_enabled && prune_now
             ? std::chrono::steady_clock::now() : loop_start;
         const size_t removed = prune_now ? prune_dominated(
-            next, DOMINANCE_COMPARISONS, base_after[i],
+            next, base_after[i],
             next_connectivity_pool, signature_words,
             profile_enabled ? &profile : nullptr) : 0;
         if (profile_enabled) {
@@ -4104,8 +4078,7 @@ int main(int argc, char** argv) {
             std::cerr << "Profile: dominance removed " << comma_number(p.exact_pruned)
                       << " exact, " << comma_number(p.forward_pruned)
                       << " forward, " << comma_number(p.reverse_pruned)
-                      << " reverse; budget exhausted in "
-                      << p.dominance_budget_exhausted << " layers\n";
+                      << " reverse\n";
         }
         std::cerr << "Solve time: " << std::fixed << std::setprecision(3)
                   << solution.solve_seconds << " seconds\n";
