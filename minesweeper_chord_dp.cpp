@@ -112,6 +112,9 @@ struct ProfileStats {
     uint64_t forward_pruned = 0;
     uint64_t reverse_pruned = 0;
     uint64_t conditional_pruned = 0;
+    uint64_t dominance_passes = 0;
+    uint64_t deferred_layers = 0;
+    uint64_t peak_generated_states = 0;
 };
 
 struct Solution {
@@ -3309,15 +3312,28 @@ static Solution solve_frontier_core(const Model& original_model,
             connectivity_pool.swap(released);
         }
 
-        if (profile_enabled) profile.generated_states += next.size();
-        const auto prune_start = profile_enabled ? std::chrono::steady_clock::now() : loop_start;
-        const size_t removed = prune_dominated(
+        if (profile_enabled) {
+            profile.generated_states += next.size();
+            profile.peak_generated_states = std::max<uint64_t>(
+                profile.peak_generated_states, next.size());
+        }
+        // Keep duplicate merging, opening absorption, and conditional branch
+        // pruning at every candidate. Apply the full dominance passes after
+        // each pair, when both candidates' effects can be compared together.
+        // The final candidate is always pruned, including an unpaired tail.
+        const bool prune_now = (i % 2 == 1) || i + 1 == q;
+        const auto prune_start = profile_enabled && prune_now
+            ? std::chrono::steady_clock::now() : loop_start;
+        const size_t removed = prune_now ? prune_dominated(
             next, DOMINANCE_COMPARISONS, base_after[i],
             next_connectivity_pool, signature_words,
-            profile_enabled ? &profile : nullptr);
+            profile_enabled ? &profile : nullptr) : 0;
         if (profile_enabled) {
-            profile.dominance += std::chrono::duration<double>(
-                std::chrono::steady_clock::now() - prune_start).count();
+            if (prune_now) {
+                ++profile.dominance_passes;
+                profile.dominance += std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - prune_start).count();
+            } else ++profile.deferred_layers;
         }
         table = std::move(next);
         connectivity_pool.swap(next_connectivity_pool);
@@ -4017,6 +4033,9 @@ int main(int argc, char** argv) {
                       << " states; generated " << comma_number(p.generated_states)
                       << " pre-pruning states\n";
             std::cerr << "Profile: conditional branches skipped " << comma_number(p.conditional_pruned) << "\n";
+            std::cerr << "Profile: dominance passes " << p.dominance_passes
+                      << "; deferred intermediate cuts " << p.deferred_layers
+                      << "; peak generated states " << comma_number(p.peak_generated_states) << "\n";
             std::cerr << "Profile: dominance removed " << comma_number(p.exact_pruned)
                       << " exact, " << comma_number(p.forward_pruned)
                       << " forward, " << comma_number(p.reverse_pruned)
