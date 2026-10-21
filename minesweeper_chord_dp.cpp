@@ -111,6 +111,7 @@ struct ProfileStats {
     uint64_t exact_pruned = 0;
     uint64_t forward_pruned = 0;
     uint64_t reverse_pruned = 0;
+    uint64_t conditional_pruned = 0;
 };
 
 struct Solution {
@@ -2972,6 +2973,14 @@ static Solution solve_frontier_core(const Model& original_model,
             }
         }
     }
+    std::vector<FactorBits> pending_flags(q, zero_factors);
+    std::vector<FactorBits> pending_bases(q, zero_factors);
+    for (int i = 0; i < q; ++i) {
+        pending_flags[i] = flag_member[i];
+        pending_bases[i] = base_member[i];
+        Ops::retain(pending_flags[i], active_after[i]);
+        Ops::retain(pending_bases[i], active_after[i]);
+    }
     struct OpeningPattern {
         int factor_slot = -1;
         std::vector<uint64_t> remaining_border;
@@ -3052,6 +3061,13 @@ static Solution solve_frontier_core(const Model& original_model,
             std::vector<std::array<ConnectivityTransition, 2>> connectivity_cache(
                 connectivity_pool.size());
             std::vector<uint8_t> connectivity_ready(connectivity_pool.size(), 0);
+            // For each incoming connectivity signature, prove how much more
+            // future component-seeding the skip/take branch can require than
+            // its sibling. A finite bound compiles a whole family of factor
+            // patterns into one cheap conditional-dominance inequality.
+            constexpr int no_bound = std::numeric_limits<int>::max();
+            std::vector<std::array<int, 2>> sibling_penalties(
+                connectivity_pool.size(), std::array<int, 2>{no_bound, no_bound});
             // Reuse flat scratch buffers for every connectivity transition in
             // this layer. Component offsets remain valid if the word buffer
             // grows, unlike pointers into a vector.
@@ -3148,18 +3164,67 @@ static Solution solve_frontier_core(const Model& original_model,
                         computed[selected] = {next_connectivity_pool.intern(canonical),
                                               closed};
                     }
+                    // These certificates use exactly the same connectivity
+                    // relations as the later dominance pass. Factor hit bits
+                    // do not affect them. Opening absorption below is an exact
+                    // normalization, so it need not be performed first.
+                    auto& penalty = sibling_penalties[old_state.connectivity_id];
+                    if (computed[0].connectivity_id == computed[1].connectivity_id) {
+                        penalty = {0, 0};
+                    } else {
+                        const auto& skip = next_connectivity_pool[computed[0].connectivity_id];
+                        const auto& take = next_connectivity_pool[computed[1].connectivity_id];
+                        bool same_union = true;
+                        for (size_t word = 0; word < signature_words; ++word) {
+                            uint64_t skip_union = 0, take_union = 0;
+                            for (size_t offset = word; offset < skip.size(); offset += signature_words)
+                                skip_union |= skip[offset];
+                            for (size_t offset = word; offset < take.size(); offset += signature_words)
+                                take_union |= take[offset];
+                            if (skip_union != take_union) { same_union = false; break; }
+                        }
+                        if (same_union) {
+                            if (connectivity_coarsens(skip, take, signature_words)) penalty[0] = 0;
+                            else if (connectivity_exact_quotient(take, skip, signature_words))
+                                penalty[0] = static_cast<int>((skip.size() - take.size()) / signature_words);
+                            if (connectivity_coarsens(take, skip, signature_words)) penalty[1] = 0;
+                            else if (connectivity_exact_quotient(skip, take, signature_words))
+                                penalty[1] = static_cast<int>((take.size() - skip.size()) / signature_words);
+                        }
+                    }
                     connectivity_cache[old_state.connectivity_id] = std::move(computed);
                     connectivity_ready[old_state.connectivity_id] = 1;
                 }
 
-                for (int selected = 0; selected <= 1; ++selected) {
+                const int new_flags = Ops::count_new_and(
+                    factor_member[i], old_state.hits, flag_member[i]);
+                const int new_bases = Ops::count_new_and(
+                    factor_member[i], old_state.hits, base_member[i]);
+                const auto& branch = connectivity_cache[old_state.connectivity_id];
+                const auto& penalty = sibling_penalties[old_state.connectivity_id];
+                // The take-minus-skip cost is known without constructing a
+                // successor. A skipped flag can still help a later chord, so
+                // compensate for every newly hit flag that remains active.
+                // Conversely, take must compensate for active base rewards
+                // already claimed. Expired factors need no compensation.
+                const int delta = 1 + branch[1].closed - branch[0].closed + new_flags - new_bases;
+                // Prefer skip on a tie, retaining at least one branch even
+                // when both certificates apply.
+                int first_selected = 0, last_selected = 1;
+                if (penalty[0] != no_bound && delta >= penalty[0] &&
+                    delta >= penalty[0] + Ops::count_new_and(
+                        factor_member[i], old_state.hits, pending_flags[i])) {
+                    last_selected = 0;
+                } else if (penalty[1] != no_bound && -delta >= penalty[1] &&
+                    -delta >= penalty[1] + Ops::count_new_and(
+                        factor_member[i], old_state.hits, pending_bases[i])) {
+                    first_selected = 1;
+                }
+                if (profile_enabled && first_selected == last_selected) ++profile.conditional_pruned;
+                for (int selected = first_selected; selected <= last_selected; ++selected) {
                     FactorBits new_hits = old_state.hits;
-                    int factor_cost = 0;
+                    const int factor_cost = selected ? new_flags - new_bases : 0;
                     if (selected) {
-                        factor_cost += Ops::count_new_and(
-                            factor_member[i], old_state.hits, flag_member[i]);
-                        factor_cost -= Ops::count_new_and(
-                            factor_member[i], old_state.hits, base_member[i]);
                         Ops::add(new_hits, factor_member[i]);
                     }
                     Ops::retain(new_hits, active_after[i]);
@@ -3951,6 +4016,7 @@ int main(int argc, char** argv) {
                       << "Profile: processed " << comma_number(p.processed_states)
                       << " states; generated " << comma_number(p.generated_states)
                       << " pre-pruning states\n";
+            std::cerr << "Profile: conditional branches skipped " << comma_number(p.conditional_pruned) << "\n";
             std::cerr << "Profile: dominance removed " << comma_number(p.exact_pruned)
                       << " exact, " << comma_number(p.forward_pruned)
                       << " forward, " << comma_number(p.reverse_pruned)
