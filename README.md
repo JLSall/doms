@@ -217,14 +217,22 @@ board.
 
 ### Bulk CSV generation
 
-Use `--bulk` with a difficulty and board count to generate and optimally solve
-many boards:
+Use `--bulk` with a difficulty or custom size and a board count to generate and
+optimally solve many boards:
 
 ```console
 ./doms --bulk beginner 100 > beginner-results.csv
 ./doms --bulk intermediate 25 > intermediate-results.csv
 ./doms --bulk expert 10 > expert-results.csv
+./doms --bulk evil 10 > evil-results.csv
+./doms --bulk 35x35/250 10 > custom-results.csv
 ```
+
+`evil` means 30 columns by 20 rows with 130 mines, equivalent to `30x20/130`.
+Custom sizes use `NxM/K`: **width first, then height**, matching PTTACG, followed
+by the mine count. Dimensions must be positive integers; the mine count can
+range from zero to the number of cells. As with other boards, the dimensions
+must be representable unambiguously in PTTACG. Both `x` and `X` are accepted.
 
 The CSV contains these columns:
 
@@ -405,7 +413,7 @@ World of Minesweeper game URL, MBF filename, or quoted MBF hexadecimal.
 | `--benchmark-repeat N` | Run each fixed set `N` times and report aggregate median/min/max/CV statistics; requires `--benchmark`, default `3`. |
 | `--benchmark-cpu N` | Pin the single benchmark thread to logical CPU `N`; requires `--benchmark`. |
 | `--generate beginner\|intermediate\|expert` | Generate, print, and solve one random standard board. Do not also supply `BOARD`. |
-| `--bulk beginner\|intermediate\|expert COUNT` | Generate and optimally solve `COUNT` boards, writing per-board solve times in the CSV and median, p5, and p95 solve times to standard error. |
+| `--bulk beginner\|intermediate\|expert\|evil\|NxM/K COUNT` | Generate and optimally solve `COUNT` boards. `evil` is `30x20/130`; custom sizes are width x height / mines, matching PTTACG. Writes per-board solve times in the CSV and median, p5, and p95 solve times to standard error. |
 | `--seed N` | Reproduce a generated board or complete bulk sequence. Requires `--generate` or `--bulk`. |
 | `--threads N` | Set the worker count for `--bulk` or `--benchmark-multi`; default uses `hardware_concurrency()`, with a fallback of one. |
 | `--count-only` | Store only state costs and omit move reconstruction; default for bulk runs. |
@@ -535,17 +543,19 @@ Equivalent histories are merged. Connectivity signatures are interned per
 layer. Their words share one contiguous arena, with offsets, lengths, and
 hashes stored in a separate metadata array. This replaces per-signature word
 allocations and pointer indirection while retaining the same signature IDs.
-DP states are held in a dense open-addressed table. Successor insertion
-constructs a record only for a new state; replay histories are copied only for
-new or improved states. Before dominance pruning, the completed layer releases
-its lookup index, so erasure uses stable dense entry positions without hashing
-or probing. State iteration and dominance witness order stay unchanged.
-Mine/3BV factors receive reusable slots for only the
-portion of the sweep in which they are live. When at most 64 slots are required,
-the complete factor state is stored and processed as one `uint64_t`; wider
-custom boards use a dynamically sized bitset fallback. Future connectivity contacts likewise receive stable reusable
-boundary slots. When at most 128 slots are required, each unfinished component
-uses one or two 64-bit words rather than a bitset spanning every chord candidate;
+DP states are held in a dense open-addressed table. Once a layer's
+duplicate merging is complete, lookup indexes of at least 64 KiB are released:
+dominance removes
+states directly by dense-entry index, and the next transition iterates the
+survivors. This avoids hashing deleted states and reduces memory held during
+dominance pruning. Smaller layers keep their index for allocator reuse.
+Mine/3BV factors
+receive reusable slots for only the portion of the sweep in which they are
+live. When at most 64 slots are required, the complete factor state is stored
+and processed as one `uint64_t`; wider custom boards use a dynamically sized
+bitset fallback. Future connectivity contacts likewise receive stable reusable
+boundary slots. Standard boards therefore store each unfinished component in
+one or two 64-bit words rather than a bitset spanning every chord candidate;
 boundaries requiring more than 128 slots use the general representation.
 Connectivity transitions are cached per signature within each candidate step.
 Their state-hash prefixes are cached too: successors sharing connectivity only
@@ -602,6 +612,16 @@ sizes are accumulated while grouping signatures, avoiding a separate scan.
 Each bucket's connectivity-signature IDs also occupy a slice of one shared
 array, avoiding per-bucket allocations while preserving signature and witness
 order.
+
+Dominance setup's cached records point directly to stable DP table entries
+and derive the final sort field from their cached hit counts. On 64-bit builds
+this reduces each record from 48 to 32 bytes and reduces the data moved during
+sorting. Count-only mode also stores these records in one shared array, with
+a slice for each reachability bucket. Replay mode retains per-bucket buffers,
+which used less peak RSS with heap-backed chord histories in testing. Bucket
+sizes are accumulated while grouping signatures, avoiding a separate scan.
+See the [transition and setup benchmark notes](benchmarks/transition_setup_results.md)
+for measured timings, memory usage, test boards, and validation details.
 
 The common connectivity-matching path builds eligibility one fine component
 at a time. If a fine component has no containing coarse component, it rejects
