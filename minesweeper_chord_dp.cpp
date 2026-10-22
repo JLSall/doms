@@ -3321,14 +3321,16 @@ static Solution solve_frontier_core(const Model& original_model,
     const bool compact_connectivity = connectivity_slot_last.size() <= 128;
     const size_t compact_signature_words =
         std::max<size_t>(1, (connectivity_slot_last.size() + 63) / 64);
-    std::vector<std::vector<uint64_t>> compact_future_neighbors;
+    std::vector<uint64_t> compact_future_neighbors;
     if (compact_connectivity) {
-        compact_future_neighbors.assign(q, std::vector<uint64_t>(compact_signature_words, 0));
+        compact_future_neighbors.assign(
+            static_cast<size_t>(q) * compact_signature_words, 0);
         for (int i = 0; i < q; ++i) {
             for (int candidate = i + 1; candidate < q; ++candidate) {
                 if (!test_bit(future_neighbors[i], candidate)) continue;
                 const int slot = connectivity_slot[candidate];
-                compact_future_neighbors[i][slot / 64] |= uint64_t{1} << (slot % 64);
+                compact_future_neighbors[static_cast<size_t>(i) * compact_signature_words +
+                                         slot / 64] |= uint64_t{1} << (slot % 64);
             }
         }
     }
@@ -3451,7 +3453,9 @@ static Solution solve_frontier_core(const Model& original_model,
                             const uint64_t current_bit = current_connectivity_slot >= 0
                                 ? uint64_t{1} << current_connectivity_slot : 0;
                             uint64_t merged_word = selected
-                                ? (compact_connectivity ? compact_future_neighbors[i][0]
+                                ? (compact_connectivity
+                                       ? compact_future_neighbors[
+                                             static_cast<size_t>(i) * compact_signature_words]
                                                         : future_neighbors[i][0])
                                 : 0;
                             outgoing_words.reserve(old_signature.size() + selected);
@@ -3482,7 +3486,11 @@ static Solution solve_frontier_core(const Model& original_model,
                         outgoing_offsets.reserve(old_component_count + selected);
                         if (selected) {
                             if (compact_connectivity) {
-                                merged = compact_future_neighbors[i];
+                                std::copy_n(
+                                    compact_future_neighbors.begin() +
+                                        static_cast<std::ptrdiff_t>(
+                                            static_cast<size_t>(i) * compact_signature_words),
+                                    compact_signature_words, merged.begin());
                             } else {
                                 for (size_t word = 0; word < chosen_words; ++word) {
                                     merged[word] = future_neighbors[i][word];

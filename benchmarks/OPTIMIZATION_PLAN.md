@@ -2395,3 +2395,198 @@ runner, solver JSON/profile outputs, raw benchmark logs, and `results.json`
 are retained in the artifact directory above. Existing workspace edits and
 benchmark references were preserved. The restored solver source matches its
 baseline snapshot byte-for-byte; `doms.exe` is the measured baseline binary.
+
+## Experiment: cache opening-absorption component matches per transition
+
+Opening absorption repeatedly searches the same outgoing connectivity signature
+for each factor state. Cache each opening's matching component range once per
+incoming connectivity and branch, in a flat arena with stable offsets. Keep
+opening order, factor-bit checks, duplicate-component consumption, normalization,
+and successor insertion order unchanged. Omit openings with no matching component.
+Canonical signatures sort equal components contiguously, including wide signatures.
+No objective, dominance certificate, search limit, or benchmark reference changes.
+
+Build baseline and changed sources with identical MSYS2 UCRT64 C++17 flags.
+Compare component-range absorption against direct scans on randomized and boundary
+cases, then compare complete count-only/replay results and pruning counters.
+Run sequential plain --benchmark invocations in baseline/changed/changed/baseline
+order. Retain only a measurable improvement; otherwise revert this experiment's
+solver change and stop. Artifacts are outside version control under
+`%TEMP%\doms-union-merge-20261021` (the directory name predates candidate selection).
+
+### Results: reverted; no reliable measurable improvement
+
+Baseline and changed builds used MSYS2 UCRT64 GCC with identical
+`-std=c++17 -O3 -DNDEBUG -pthread` optimization flags. The changed build also
+used `-Wall -Wextra -Wpedantic` and compiled without diagnostics. All four
+invocations used plain `--benchmark`: one thread, high priority (successful),
+100 warm-up boards per fixed set, and three timed repeats. Runs were sequential
+A/B/B/A, with no compilation or other solver jobs from this session overlapping
+measurements. Cells sum solve seconds across the three timed repeats:
+
+| Fixed Expert set | Baseline 1 | Changed 1 | Changed 2 | Baseline 2 |
+| --- | ---: | ---: | ---: | ---: |
+| 1 | 46.573818 | 45.143833 | 44.847931 | 44.689582 |
+| 2 | 44.708775 | 43.738616 | 43.759603 | 43.508036 |
+| 3 | 43.048748 | 42.822184 | 42.504429 | 41.751167 |
+| Total solve seconds | 134.331341 | 131.704633 | 131.111963 | 129.948785 |
+
+Mean solve time was **132.140063 s baseline** versus **131.408298 s changed**,
+a nominal **0.554% reduction**. However, the first adjacent pair favored the
+change by 1.96%, while the second favored baseline by 0.90%; every fixed set
+reversed direction between pairs. Baseline invocation totals drifted by 3.26%,
+well above the mean separation. Mean CPU times were 130.929688 s baseline and
+130.453125 s changed, also with contradictory adjacent pairs. These results do
+not establish a reliable measurable speed improvement. The solver change was
+reverted and no follow-on optimization was attempted. Peak memory was not measured.
+
+- All four benchmarks passed unchanged board, 3BV, and optimal-click references:
+  36,000 timed solves and 1,200 warm-ups over 3,000 distinct Expert boards.
+- An assertion-enabled temporary harness exercised the actual component-range
+  helper against independent direct scans on 30,000 seeded canonical signatures,
+  with 40 sequential opening operations per signature: 1,200,000 checks. It
+  covered one through four words, empty signatures, duplicate components, bit 63,
+  63/64/65/129-component boundaries, absent matches, exhausted ranges, and
+  repeated factor slots. Matching ranges, consumed components, and factor bits
+  agreed throughout.
+- All non-timing JSON fields, exact replay actions, and four state/pruning
+  counter lines matched across 36 baseline/changed comparisons: three standard
+  difficulties, seeds 1, 42, 100, 2026, 123456, and 8675309, in both solve modes.
+  All 18 changed replays passed built-in legal-action validation.
+
+Baseline/changed source snapshots, measured executables, temporary harness and
+comparison scripts, solver JSON/profile outputs, raw benchmark logs, and
+`results.json` are retained in the artifact directory above. The restored source
+matches its baseline snapshot byte-for-byte; `doms.exe` is the measured baseline
+binary. Benchmark reference data is unchanged. Only this experiment's plan and
+results remain as tracked changes.
+
+## Experiment: insert the merged one-word transition component in order
+
+For selected-chord transitions with one-word connectivity, all retained
+components are unchanged: components containing the current bit are consumed
+by the merge. Their canonical ascending order therefore survives filtering.
+Insert the single merged component with lower_bound instead of sorting the
+entire outgoing signature. Keep the skip branch and multiword path unchanged.
+Duplicates, closed-component counts, interned words, insertion order, replay
+ties, pruning certificates, objectives, and search limits remain unchanged.
+
+Build baseline and changed versions with identical MSYS2 UCRT64 C++17 flags.
+Compare the actual transition block on randomized/boundary signatures and
+compare full replay/count-only results and search counters. Run sequential
+plain --benchmark invocations in A/B/B/A order, retaining default warm-ups
+and three repeats. Retain only a measurable improvement; otherwise revert
+the solver change and stop. Preserve the existing optimization-plan edits.
+Temporary artifacts: %TEMP%\doms-sorted-transition-20261021.
+
+### Results: reverted; no measurable speed improvement
+
+Both builds used MSYS2 UCRT64 GCC 16.1.0 with identical
+`-std=c++17 -O3 -DNDEBUG -pthread` optimization flags. The changed build
+also enabled `-Wall -Wextra -Wpedantic` and compiled without diagnostics.
+Four plain `--benchmark` invocations ran sequentially in A/B/B/A order,
+with no compilation or other solver jobs from this session overlapping
+measurement. Each used one thread, high priority (successful), 100 warm-up
+boards per fixed set, and three timed repeats. Cells sum solve seconds
+across each fixed set's three repeats:
+
+| Fixed Expert set | Baseline 1 | Changed 1 | Changed 2 | Baseline 2 |
+| --- | ---: | ---: | ---: | ---: |
+| 1 | 43.006921 | 43.168481 | 43.869174 | 42.949016 |
+| 2 | 42.013538 | 41.733076 | 43.859144 | 41.935347 |
+| 3 | 40.726993 | 40.376488 | 41.462104 | 40.791786 |
+| Total solve seconds | 125.747452 | 125.278045 | 129.190422 | 125.676149 |
+
+Mean solve time was **125.711801 s baseline** versus **127.234234 s changed**,
+a **1.21% slowdown**. The first adjacent pair favored the change by 0.37%,
+while the second favored baseline by 2.80%. Mean CPU times were 124.898438 s
+baseline and 126.312500 s changed. These measurements do not establish a
+speed improvement. The solver change was reverted and no follow-on
+optimization was attempted. Peak memory was not measured.
+
+- All four benchmarks passed unchanged board, 3BV, and optimal-click references:
+  36,000 timed solves plus 1,200 warm-up solves over 3,000 distinct Expert boards.
+- An assertion-enabled temporary harness extracted the actual baseline and
+  changed one-word transition blocks. All 600,000 branch results matched on
+  300,000 seeded canonical signatures, comparing outgoing words and closed
+  component counts. Cases included empty signatures, duplicate components,
+  zero future reach, absent current slots, bit 63, and component counts through
+  129, with both compact and direct future-neighbor sources.
+- All non-timing JSON fields, exact replay actions, and four search/pruning
+  counter lines matched in 36 full-solver comparisons: three difficulties;
+  seeds 1, 42, 100, 2026, 123456, and 8675309; count-only and replay modes.
+  All 18 changed replays passed the built-in legal-action validation.
+
+Baseline/changed source snapshots and executables, the extracted transition
+harness, runner, solver JSON/profile outputs, raw benchmark logs,
+`results.json`, and `summary.json` are outside version control under
+`%TEMP%\doms-sorted-transition-20261021`. Existing optimization-plan edits
+were preserved. The restored solver source matches its baseline snapshot
+byte-for-byte; `doms.exe` is the measured baseline binary. Benchmark reference
+data is unchanged. Only this experiment's plan and results remain as new
+tracked edits.
+
+## Experiment: flatten compact future-neighbor rows
+
+The compact-connectivity path stored one fixed-width future-neighbor bit row
+per candidate in `vector<vector<uint64_t>>`, causing one heap allocation per
+row. Store the same rows in one flat word vector and address each row by its
+fixed-width offset. Bit construction and transition order remain unchanged;
+the wide-connectivity representation is untouched. No objective, dominance
+certificate, search limit, or benchmark reference changes.
+
+Build baseline and changed sources with identical MSYS2 UCRT64 C++17 flags.
+Run plain `--benchmark` sequentially in baseline/changed/changed/baseline
+order. Keep the storage change only if the paired measurements show a
+measurable improvement; otherwise revert it and stop. Temporary source,
+binaries, and logs are under `%TEMP%\doms-flat-neighbors-20261021`.
+
+### Results: retained
+
+Both binaries used MSYS2 UCRT64 GCC 16.1.0 and identical
+`-std=c++17 -O3 -DNDEBUG -pthread` flags. The changed build also enabled
+`-Wall -Wextra -Wpedantic` and compiled without diagnostics. Four plain
+`--benchmark` invocations ran sequentially in A/B/B/A order. Each passed the
+fixed Expert references, using 100 warm-up boards per set and three timed
+repeats. No other solver or compilation jobs overlapped measurement. The
+cells below sum each set's solve seconds across its three timed repeats:
+
+| Fixed Expert set | Baseline 1 | Changed 1 | Changed 2 | Baseline 2 |
+| --- | ---: | ---: | ---: | ---: |
+| 1 | 56.612283 | 56.092937 | 55.319535 | 56.309386 |
+| 2 | 55.822641 | 55.778040 | 54.705420 | 55.553878 |
+| 3 | 55.482039 | 55.309123 | 54.327239 | 55.506723 |
+| Total solve seconds | 167.916963 | 167.180100 | 164.352194 | 167.369987 |
+
+Mean solve time decreased from **167.643475 s to 165.766147 s (1.12%)**.
+Both adjacent pairs improved (0.44% and 1.81%), and all six corresponding
+fixed-set totals were lower with the flattened rows. The two changed runs
+were also mutually consistent with a 1.70% difference, while baseline totals
+differed by 0.33%.
+
+- All four runs passed unchanged board, 3BV, and optimal-click references:
+  36,000 timed solves and 1,200 warm-ups over 3,000 distinct Expert boards.
+- The representation change preserves each row's word order and exact bits;
+  it does not alter connectivity signatures or successor insertion order.
+- `git diff --check` passed. Benchmark reference data is unchanged.
+
+The source snapshot, both measured binaries, and raw benchmark logs are
+retained outside version control under `%TEMP%\doms-flat-neighbors-20261021`.
+
+## Follow-up candidate: exact separator decomposition for wide frontiers
+
+Investigate an alternate exact solve path for boards whose best available
+frontier order still has a large peak boundary. Build the decomposition over
+the complete dependency structure: chord adjacency, zero-scope propagation,
+and factor scopes must all be represented so that neither connectivity nor
+factor rewards are lost across a separator. The separator interface must carry
+the selected boundary choices, pending factor hits, and connectivity
+equivalence among boundary vertices; combine subproblem costs only after
+accounting for shared flags, base rewards, and seed components.
+
+Start with a prototype that only detects candidate separators and reports
+their sizes and projected state counts. Then implement a bounded-width exact
+composition for small separators and compare it differentially with the
+existing frontier DP. Benchmark separately on boards with wide frontiers and
+on the fixed Expert set; dispatch to it only when measured total work is lower.
+This is a larger algorithm change and is not part of the flat-row experiment.
