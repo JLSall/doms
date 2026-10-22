@@ -213,14 +213,22 @@ board.
 
 ### Bulk CSV generation
 
-Use `--bulk` with a difficulty and board count to generate and optimally solve
-many boards:
+Use `--bulk` with a difficulty or custom size and a board count to generate and
+optimally solve many boards:
 
 ```console
 ./doms --bulk beginner 100 > beginner-results.csv
 ./doms --bulk intermediate 25 > intermediate-results.csv
 ./doms --bulk expert 10 > expert-results.csv
+./doms --bulk evil 10 > evil-results.csv
+./doms --bulk 35x35/250 10 > custom-results.csv
 ```
+
+`evil` means 30 columns by 20 rows with 130 mines, equivalent to `30x20/130`.
+Custom sizes use `NxM/K`: **width first, then height**, matching PTTACG, followed
+by the mine count. Dimensions must be positive integers; the mine count can
+range from zero to the number of cells. As with other boards, the dimensions
+must be representable unambiguously in PTTACG. Both `x` and `X` are accepted.
 
 The CSV contains these columns:
 
@@ -382,7 +390,7 @@ World of Minesweeper game URL, MBF filename, or quoted MBF hexadecimal.
 | `--benchmark` | Run three fixed sets of 1,000 Expert boards on one thread, validate every board and count against committed references, and report total/median/p5/p95 seconds for each run. |
 | `--benchmark-multi` | Run the same fixed benchmark using available CPU threads; accepts `--threads N` to set the worker count. |
 | `--generate beginner\|intermediate\|expert` | Generate, print, and solve one random standard board. Do not also supply `BOARD`. |
-| `--bulk beginner\|intermediate\|expert COUNT` | Generate and optimally solve `COUNT` boards, writing per-board solve times in the CSV and median, p5, and p95 solve times to standard error. |
+| `--bulk beginner\|intermediate\|expert\|evil\|NxM/K COUNT` | Generate and optimally solve `COUNT` boards. `evil` is `30x20/130`; custom sizes are width x height / mines, matching PTTACG. Writes per-board solve times in the CSV and median, p5, and p95 solve times to standard error. |
 | `--seed N` | Reproduce a generated board or complete bulk sequence. Requires `--generate` or `--bulk`. |
 | `--threads N` | Set the number of bulk solver threads; default uses `hardware_concurrency()`, with a fallback of one. Requires `--bulk`. |
 | `--count-only` | Store only state costs and omit move reconstruction; default for bulk runs. |

@@ -604,6 +604,40 @@ static std::tuple<int, int, int> standard_board_spec(const std::string& difficul
     return {height, width, mine_count};
 }
 
+static std::tuple<int, int, int> bulk_board_spec(const std::string& spec) {
+    if (spec == "evil") return {20, 30, 130};
+    if (spec == "beginner" || spec == "intermediate" || spec == "expert") {
+        return standard_board_spec(spec);
+    }
+    std::smatch match;
+    static const std::regex custom_size(R"(([0-9]+)[xX]([0-9]+)/([0-9]+))");
+    if (!std::regex_match(spec, match, custom_size)) {
+        throw UserError("--bulk must be beginner, intermediate, expert, evil, or NxM/K "
+                        "(width x height / mines)");
+    }
+    uint64_t width, height, mine_count;
+    try {
+        width = std::stoull(match[1].str());
+        height = std::stoull(match[2].str());
+        mine_count = std::stoull(match[3].str());
+    } catch (const std::exception&) {
+        throw UserError("--bulk board dimensions or mine count are too large");
+    }
+    const auto max_cells = static_cast<uint64_t>(std::numeric_limits<int>::max());
+    if (width == 0 || height == 0) {
+        throw UserError("--bulk board width and height must be positive");
+    }
+    // Cell indices and counts throughout the solver use int.
+    if (width > max_cells || height > max_cells || width * height > max_cells) {
+        throw UserError("--bulk board has too many cells for integer cell indices");
+    }
+    if (mine_count > width * height) {
+        throw UserError("--bulk mine count cannot exceed width * height");
+    }
+    // PTTACG lists width first; Board and the generator take height first.
+    return {static_cast<int>(height), static_cast<int>(width), static_cast<int>(mine_count)};
+}
+
 static uint64_t random_seed() {
     std::random_device rd;
     uint64_t seed = 0;
@@ -614,9 +648,9 @@ static uint64_t random_seed() {
     return seed;
 }
 
-static Board generate_standard_board(const std::string& difficulty,
-                                     std::mt19937_64& rng) {
-    const auto [height, width, mine_count] = standard_board_spec(difficulty);
+static Board generate_random_board(const std::tuple<int, int, int>& spec,
+                                   std::mt19937_64& rng) {
+    const auto [height, width, mine_count] = spec;
     std::vector<int> cells(height * width);
     std::iota(cells.begin(), cells.end(), 0);
     auto bounded_random = [&](uint64_t bound) {
@@ -634,6 +668,11 @@ static Board generate_standard_board(const std::string& difficulty,
     Board board{height, width, std::vector<uint8_t>(height * width, 0)};
     for (int i = 0; i < mine_count; ++i) board.mines[cells[i]] = 1;
     return board;
+}
+
+static Board generate_standard_board(const std::string& difficulty,
+                                     std::mt19937_64& rng) {
+    return generate_random_board(standard_board_spec(difficulty), rng);
 }
 
 static Board generate_standard_board(const std::string& difficulty,
@@ -4143,7 +4182,7 @@ struct Options {
     bool benchmark_multi = false;
     std::optional<std::string> board;
     std::optional<std::string> generate;
-    std::optional<std::string> bulk;
+    std::optional<std::tuple<int, int, int>> bulk;
     size_t bulk_count = 0;
     std::optional<size_t> threads;
     std::optional<bool> count_only;
@@ -4167,8 +4206,9 @@ static void print_help(const char* program) {
         << "  --benchmark-multi              Same fixed benchmark using multiple threads\n"
         << "  --generate beginner|intermediate|expert\n"
         << "                                 Generate, print, and solve one random board\n"
-        << "  --bulk beginner|intermediate|expert COUNT\n"
+        << "  --bulk beginner|intermediate|expert|evil|NxM/K COUNT\n"
         << "                                 Generate and solve COUNT boards; write CSV\n"
+        << "                                 evil = 30x20/130; NxM/K = width x height / mines\n"
         << "  --seed N                       Reproduce generated or bulk boards\n"
         << "  --threads N                    Bulk workers (default: one per available core)\n"
         << "  --count-only                   Compute click count without a move replay\n"
@@ -4228,7 +4268,7 @@ static Options parse_options(int argc, char** argv) {
         }
         else if (arg == "--generate") options.generate = value_after(i, arg);
         else if (arg == "--bulk") {
-            options.bulk = value_after(i, arg);
+            options.bulk = bulk_board_spec(value_after(i, arg));
             options.bulk_count = parse_positive_size(value_after(i, arg), arg);
         }
         else if (arg == "--seed") options.seed = parse_u64(value_after(i, arg), arg);
@@ -4263,9 +4303,6 @@ static Options parse_options(int argc, char** argv) {
     }
     if (options.bulk) {
         if (options.profile) throw UserError("--profile is for single boards only");
-        if (!valid_difficulty(*options.bulk)) {
-            throw UserError("--bulk must be beginner, intermediate, or expert");
-        }
         if (options.board) throw UserError("do not supply a board argument with --bulk");
         if (options.json || options.click_tuples) {
             throw UserError("--bulk already writes CSV; do not combine it with --json or --click-tuples");
@@ -4522,7 +4559,7 @@ int main(int argc, char** argv) {
                 };
                 std::vector<Job> jobs(batch);
                 for (size_t j = 0; j < batch; ++j) {
-                    jobs[j].board = generate_standard_board(*options.bulk, rng);
+                    jobs[j].board = generate_random_board(*options.bulk, rng);
                     jobs[j].encoded = format_pttacg_string(jobs[j].board);
                 }
                 std::atomic<size_t> next{0};
