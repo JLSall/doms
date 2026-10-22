@@ -537,7 +537,10 @@ hashes stored in a separate metadata array. This replaces per-signature word
 allocations and pointer indirection while retaining the same signature IDs.
 DP states are held in a dense open-addressed table. Successor insertion
 constructs a record only for a new state; replay histories are copied only for
-new or improved states. Mine/3BV factors receive reusable slots for only the
+new or improved states. Before dominance pruning, the completed layer releases
+its lookup index, so erasure uses stable dense entry positions without hashing
+or probing. State iteration and dominance witness order stay unchanged.
+Mine/3BV factors receive reusable slots for only the
 portion of the sweep in which they are live. When at most 64 slots are required,
 the complete factor state is stored and processed as one `uint64_t`; wider
 custom boards use a dynamically sized bitset fallback. Future connectivity contacts likewise receive stable reusable
@@ -596,6 +599,9 @@ sorting. Count-only mode also stores these records in one shared array, with
 a slice for each reachability bucket. Replay mode retains per-bucket buffers,
 which used less peak RSS with heap-backed chord histories in testing. Bucket
 sizes are accumulated while grouping signatures, avoiding a separate scan.
+Each bucket's connectivity-signature IDs also occupy a slice of one shared
+array, avoiding per-bucket allocations while preserving signature and witness
+order.
 
 The common connectivity-matching path builds eligibility one fine component
 at a time. If a fine component has no containing coarse component, it rejects

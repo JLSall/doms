@@ -2161,6 +2161,14 @@ public:
     iterator begin() { return iterator(this, 0); }
     iterator end() { return iterator(this, entries_.size()); }
 
+    // Completed layers only erase and iterate. Dense entry positions remain
+    // stable, so pruning no longer needs the duplicate-lookup index.
+    void release_lookup_index() {
+        std::vector<uint32_t>().swap(slots_);
+        used_slots_ = 0;
+        deleted_slots_ = 0;
+    }
+
     void reserve(size_t count) {
         if (count > static_cast<size_t>(DELETED) - 1) {
             throw std::length_error("too many DP states for the flat table");
@@ -2279,18 +2287,20 @@ public:
     void erase(iterator where) {
         const size_t entry_index = where.index_;
         if (entry_index >= entries_.size() || !alive_[entry_index]) return;
-        const size_t mask = slots_.size() - 1;
-        size_t slot = StateHash{}(entries_[entry_index].first) & mask;
-        while (slots_[slot] != EMPTY) {
-            if (slots_[slot] == entry_index) {
-                slots_[slot] = DELETED;
-                ++deleted_slots_;
-                break;
+        if (!slots_.empty()) {
+            const size_t mask = slots_.size() - 1;
+            size_t slot = StateHash{}(entries_[entry_index].first) & mask;
+            while (slots_[slot] != EMPTY) {
+                if (slots_[slot] == entry_index) {
+                    slots_[slot] = DELETED;
+                    ++deleted_slots_;
+                    break;
+                }
+                slot = (slot + 1) & mask;
             }
-            slot = (slot + 1) & mask;
-        }
-        if (slots_[slot] == EMPTY) {
-            throw std::logic_error("flat DP table lost an indexed state");
+            if (slots_[slot] == EMPTY) {
+                throw std::logic_error("flat DP table lost an indexed state");
+            }
         }
         alive_[entry_index] = 0;
         --live_size_;
@@ -2606,8 +2616,15 @@ static size_t prune_dominated(FactorTable<FactorBits, TrackChosen>& table,
         CachedItem* end() { return data + count; }
         void push_back(CachedItem item) { data[count++] = item; }
     };
+    struct IdList {
+        uint32_t* data = nullptr;
+        size_t count = 0;
+        uint32_t* begin() const { return data; }
+        uint32_t* end() const { return data + count; }
+        size_t size() const { return count; }
+    };
     struct Bucket {
-        std::vector<uint32_t> connectivity_ids;
+        IdList connectivity_ids;
         std::conditional_t<TrackChosen, std::vector<CachedItem>, CachedList> entries;
         size_t state_count = 0;
         // If two future boundary positions occur together in a fine component,
@@ -2684,8 +2701,22 @@ static size_t prune_dominated(FactorTable<FactorBits, TrackChosen>& table,
         }
         if (new_bucket) buckets.emplace_back();
         connectivity_bucket[id] = bucket;
-        buckets[bucket].connectivity_ids.push_back(id);
+        ++buckets[bucket].connectivity_ids.count;
         buckets[bucket].state_count += state_counts[id];
+    }
+    // Assign disjoint slices before filling IDs in their original order.
+    // No per-bucket growth or allocation is needed, and slices stay stable.
+    std::vector<uint32_t> bucket_id_storage(connectivity_count);
+    size_t bucket_id_offset = 0;
+    for (auto& bucket : buckets) {
+        bucket.connectivity_ids.data = bucket_id_storage.data() + bucket_id_offset;
+        bucket_id_offset += bucket.connectivity_ids.count;
+        bucket.connectivity_ids.count = 0;
+    }
+    for (uint32_t id = 0; id < connectivity_count; ++id) {
+        if (state_counts[id] == 0) continue;
+        auto& ids = buckets[connectivity_bucket[id]].connectivity_ids;
+        ids.data[ids.count++] = id;
     }
     if (signature_words == 1) {
         for (auto& bucket : buckets) {
@@ -2858,7 +2889,8 @@ static size_t prune_dominated(FactorTable<FactorBits, TrackChosen>& table,
         if (survivors[fine_id].empty()) continue;
         coarser.clear();
         const auto& bucket = buckets[connectivity_bucket[fine_id]];
-        const std::vector<uint32_t>* candidate_ids = &bucket.connectivity_ids;
+        const uint32_t* candidate_begin = bucket.connectivity_ids.begin();
+        size_t candidate_count = bucket.connectivity_ids.size();
         if (!bucket.pair_postings.empty()) {
             for (uint64_t component : connectivity_pool[fine_id]) {
                 for (uint64_t outer = component; outer; outer &= outer - 1) {
@@ -2869,15 +2901,18 @@ static size_t prune_dominated(FactorTable<FactorBits, TrackChosen>& table,
                         inner &= inner - 1;
                         const int index = bucket.pair_index[(a << 6) | b];
                         if (index >= 0 &&
-                            bucket.pair_postings[index].size() < candidate_ids->size()) {
-                            candidate_ids = &bucket.pair_postings[index];
+                            bucket.pair_postings[index].size() < candidate_count) {
+                            const auto& posting = bucket.pair_postings[index];
+                            candidate_begin = posting.data();
+                            candidate_count = posting.size();
                         }
                     }
                 }
             }
         }
-        coarser.reserve(candidate_ids->size());
-        for (uint32_t coarse_id : *candidate_ids) {
+        coarser.reserve(candidate_count);
+        for (size_t candidate_index = 0; candidate_index < candidate_count; ++candidate_index) {
+            const uint32_t coarse_id = candidate_begin[candidate_index];
             if (coarse_id == fine_id || survivors[coarse_id].empty()) continue;
             if (component_counts[coarse_id] > component_counts[fine_id]) continue;
             if (maximum_component_population[fine_id] >
@@ -3713,6 +3748,7 @@ static Solution solve_frontier_core(const Model& original_model,
         // each pair, when both candidates' effects can be compared together.
         // The final candidate is always pruned, including an unpaired tail.
         const bool prune_now = (i % 2 == 1) || i + 1 == q;
+        if (prune_now) next.release_lookup_index();
         const auto prune_start = profile_enabled && prune_now
             ? std::chrono::steady_clock::now() : loop_start;
         const size_t removed = prune_now ? prune_dominated(
