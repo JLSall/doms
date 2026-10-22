@@ -906,11 +906,21 @@ static CandidateRelations candidate_relations(const Model& model) {
     for (int candidate = 0; candidate < q; ++candidate) {
         for (int other : model.graph[candidate]) connect(candidate, other);
     }
+    // Each opening induces a clique. Union its candidate mask into each
+    // member's neighbors instead of connecting every pair separately.
+    std::vector<uint64_t> opening_members(candidate_words, 0);
     for (const auto& scope : model.zero_scopes) {
-        for (size_t i = 0; i < scope.size(); ++i) {
-            for (size_t j = i + 1; j < scope.size(); ++j) connect(scope[i], scope[j]);
+        std::fill(opening_members.begin(), opening_members.end(), 0);
+        for (int candidate : scope)
+            opening_members[candidate / 64] |= uint64_t{1} << (candidate % 64);
+        for (int candidate : scope) {
+            for (size_t word = 0; word < candidate_words; ++word)
+                relations.propagation[candidate][word] |= opening_members[word];
         }
     }
+    for (int candidate = 0; candidate < q; ++candidate)
+        relations.propagation[candidate][candidate / 64] &=
+            ~(uint64_t{1} << (candidate % 64));
     for (size_t factor = 0; factor < model.mine_scopes.size(); ++factor) {
         for (int candidate : model.mine_scopes[factor]) {
             relations.mine_factors[candidate][factor / 64] |= uint64_t{1} << (factor % 64);
@@ -1147,47 +1157,50 @@ static uint64_t estimated_cut_work(int width) {
     return uint64_t{1} << std::min(width, 60);
 }
 
-static WidthEstimate width_estimate(const Model& model, const std::vector<int>& order,
-                                    int first_cut = 0, int end_cut = -1) {
-    const int q = static_cast<int>(order.size());
-    if (end_cut < 0) end_cut = q - 1;
-    std::vector<int> inverse(q);
-    for (int i = 0; i < q; ++i) inverse[order[i]] = i;
-    // Each interval contributes on [first, last). Accumulate endpoint
-    // changes once instead of rescanning every interval at every cut.
-    std::vector<int> graph_delta(q + 1, 0), factor_delta(q + 1, 0);
-    for (int old : order) {
+struct WidthEstimateSelection {
+    std::vector<int> vertices;
+    std::vector<const std::vector<int>*> openings, factors;
+};
+
+// Score a permutation through its inverse, reusing endpoint buffers across calls.
+static WidthEstimate width_estimate_from_inverse(const Model& model,
+                                    const std::vector<int>& inverse,
+                                    int first_cut, int end_cut,
+                                    std::vector<int>& graph_delta,
+                                    std::vector<int>& factor_delta,
+                                    const WidthEstimateSelection* selection = nullptr) {
+    const int q = static_cast<int>(inverse.size());
+    // Each interval contributes on [first, last).
+    std::fill(graph_delta.begin(), graph_delta.end(), 0);
+    std::fill(factor_delta.begin(), factor_delta.end(), 0);
+    auto add_vertex = [&](int old) {
         const int position = inverse[old];
         int last = position;
         for (int other : model.graph[old]) {
             if (inverse[other] > position) last = std::max(last, inverse[other]);
         }
         if (last > position) { ++graph_delta[position]; --graph_delta[last]; }
-    }
-    for (const auto& scope : model.zero_scopes) {
-        if (scope.empty()) continue;
+    };
+    auto add_scope = [&](const std::vector<int>& scope, std::vector<int>& delta) {
+        if (scope.empty()) return;
         int first = q;
         int last = -1;
         for (int item : scope) {
             first = std::min(first, inverse[item]);
             last = std::max(last, inverse[item]);
         }
-        if (first < last) { ++graph_delta[first]; --graph_delta[last]; }
-    }
-    auto add_factors = [&](const std::vector<std::vector<int>>& scopes) {
-        for (const auto& scope : scopes) {
-            if (scope.empty()) continue;
-            int first = q;
-            int last = -1;
-            for (int item : scope) {
-                first = std::min(first, inverse[item]);
-                last = std::max(last, inverse[item]);
-            }
-            if (first < last) { ++factor_delta[first]; --factor_delta[last]; }
-        }
+        if (first < last) { ++delta[first]; --delta[last]; }
     };
-    add_factors(model.mine_scopes);
-    add_factors(model.base_scopes);
+    if (selection) {
+        for (int old : selection->vertices) add_vertex(old);
+        for (const auto* scope : selection->openings) add_scope(*scope, graph_delta);
+        for (const auto* scope : selection->factors) add_scope(*scope, factor_delta);
+    } else {
+        for (int old = 0; old < q; ++old) add_vertex(old);
+        for (const auto& scope : model.zero_scopes) add_scope(scope, graph_delta);
+        for (const auto& scope : model.mine_scopes) add_scope(scope, factor_delta);
+        for (const auto& scope : model.base_scopes) add_scope(scope, factor_delta);
+    }
     int max_graph = 0;
     int max_factors = 0;
     int max_total = 0;
@@ -1203,6 +1216,17 @@ static WidthEstimate width_estimate(const Model& model, const std::vector<int>& 
         work = saturated_add(work, estimated_cut_work(graph + factors));
     }
     return {max_total, max_graph, max_factors, work};
+}
+
+static WidthEstimate width_estimate(const Model& model, const std::vector<int>& order,
+                                    int first_cut = 0, int end_cut = -1) {
+    const int q = static_cast<int>(order.size());
+    if (end_cut < 0) end_cut = q - 1;
+    std::vector<int> inverse(q);
+    for (int i = 0; i < q; ++i) inverse[order[i]] = i;
+    std::vector<int> graph_delta(q + 1), factor_delta(q + 1);
+    return width_estimate_from_inverse(model, inverse, first_cut, end_cut,
+                                       graph_delta, factor_delta);
 }
 
 // For each bit, add the lower half of each block into its upper half.
@@ -1504,34 +1528,87 @@ static DynamicBandOrder dynamic_band_order(const Model& model,
         WidthEstimate estimate;
         std::vector<int> inside;
     };
+    // Positions outside the current band stay in plain sweep order.
+    std::vector<int> plain_inverse(q), inverse(q);
+    for (int line = 0; line < lines; ++line) {
+        int position = prefix[line];
+        for (int candidate : by_line[line]) plain_inverse[candidate] = position++;
+    }
+    std::vector<int> graph_delta(q + 1), factor_delta(q + 1);
+    // Only contributions intersecting this start's largest band can affect
+    // any of its cut scores. Extents use sweep lines, independent of the
+    // changing order inside a band; nonlocal scopes remain fully supported.
+    auto sweep_line = [&](int candidate) {
+        const int cell = model.candidates[candidate];
+        const int physical = columns ? cell % model.width : cell / model.width;
+        return reverse ? lines - 1 - physical : physical;
+    };
+    std::vector<std::pair<int, int>> vertex_extents(q);
+    for (int candidate = 0; candidate < q; ++candidate) {
+        const int first = sweep_line(candidate);
+        int last = first;
+        for (int other : model.graph[candidate]) last = std::max(last, sweep_line(other));
+        vertex_extents[candidate] = {first, last};
+    }
+    struct ScopeExtent {
+        const std::vector<int>* scope;
+        int first, last;
+    };
+    auto scope_extents = [&](const std::vector<std::vector<int>>& scopes) {
+        std::vector<ScopeExtent> result;
+        result.reserve(scopes.size());
+        for (const auto& scope : scopes) {
+            int first = lines, last = -1;
+            for (int item : scope) {
+                const int line = sweep_line(item);
+                first = std::min(first, line);
+                last = std::max(last, line);
+            }
+            if (last >= 0) result.push_back({&scope, first, last});
+        }
+        return result;
+    };
+    const auto openings = scope_extents(model.zero_scopes);
+    auto factors = scope_extents(model.mine_scopes);
+    const auto bases = scope_extents(model.base_scopes);
+    factors.insert(factors.end(), bases.begin(), bases.end());
+    WidthEstimateSelection selection;
     std::vector<std::vector<Edge>> edge(lines);
     for (int start = 0; start < lines; ++start) {
+        const int limit = std::min(lines, start + max_band);
+        selection.vertices.clear();
+        selection.openings.clear();
+        selection.factors.clear();
+        for (int candidate = 0; candidate < q; ++candidate) {
+            const auto [first, last] = vertex_extents[candidate];
+            if (first < limit && last >= start) selection.vertices.push_back(candidate);
+        }
+        for (const auto& extent : openings)
+            if (extent.first < limit && extent.last >= start)
+                selection.openings.push_back(extent.scope);
+        for (const auto& extent : factors)
+            if (extent.first < limit && extent.last >= start)
+                selection.factors.push_back(extent.scope);
+        inverse = plain_inverse;
         for (int end = start + 1; end <= std::min(lines, start + max_band); ++end) {
             auto& current = edge[start].emplace_back();
-            for (int line = start; line < end; ++line) {
-                current.inside.insert(current.inside.end(),
-                                      by_line[line].begin(), by_line[line].end());
+            const auto& added = by_line[end - 1];
+            if (end == start + 1) current.inside = added;
+            else {
+                const auto& previous_inside = edge[start][end - start - 2].inside;
+                current.inside.reserve(previous_inside.size() + added.size());
+                // Both inputs are secondary-sorted. Stable merging puts the
+                // earlier sweep lines first on ties, including reverse sweeps,
+                // exactly matching the full band's original sort order.
+                std::merge(previous_inside.begin(), previous_inside.end(),
+                           added.begin(), added.end(),
+                           std::back_inserter(current.inside),
+                           [&](int a, int b) { return secondary(a) < secondary(b); });
             }
-            std::sort(current.inside.begin(), current.inside.end(),
-                      [&](int a, int b) {
-                          const int sa = secondary(a), sb = secondary(b);
-                          if (sa != sb) return sa < sb;
-                          const int ca = model.candidates[a], cb = model.candidates[b];
-                          const int la = columns ? ca % model.width : ca / model.width;
-                          const int lb = columns ? cb % model.width : cb / model.width;
-                          return (reverse ? la > lb : la < lb);
-                      });
-            std::vector<int> trial;
-            trial.reserve(q);
-            for (int line = 0; line < start; ++line) {
-                trial.insert(trial.end(), by_line[line].begin(), by_line[line].end());
-            }
-            trial.insert(trial.end(), current.inside.begin(), current.inside.end());
-            for (int line = end; line < lines; ++line) {
-                trial.insert(trial.end(), by_line[line].begin(), by_line[line].end());
-            }
-            current.estimate = width_estimate(model, trial, prefix[start],
-                                               std::min(prefix[end], q - 1));
+            int position = prefix[start];
+            for (int candidate : current.inside) inverse[candidate] = position++;
+            current.estimate = width_estimate_from_inverse(model, inverse, prefix[start],
+                std::min(prefix[end], q - 1), graph_delta, factor_delta, &selection);
         }
     }
 

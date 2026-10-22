@@ -2590,3 +2590,488 @@ composition for small separators and compare it differentially with the
 existing frontier DP. Benchmark separately on boards with wide frontiers and
 on the fixed Expert set; dispatch to it only when measured total work is lower.
 This is a larger algorithm change and is not part of the flat-row experiment.
+
+## Experiment: exact separator decomposition with frontier composition
+
+Build the complete dependency graph by adding clique edges for every zero,
+mine, and base scope to chord adjacency. Recursively split disconnected
+regions, or remove a balanced separator of at most eight candidates found
+at quartile cuts of the current best order. Stop splitting regions smaller
+than twelve candidates. Linearize the tree in four deterministic ways
+(separator first/last, children forward/reverse). For automatic orders with
+estimated total width at least eighteen, consider these alternatives only
+when both the existing width ranking and projected cut work improve.
+
+Compose regions through the existing exact frontier DP: pending factor hits
+and unfinished component reachability remain in the interface across every
+region. Every candidate and factor is still processed once. In particular,
+this experiment does not sum independently optimized child costs or replace
+the interface with a scalar. It introduces no approximation, state cap, or
+new dominance certificate. The separator search is bounded; the exact solve
+is not. This is a serial composition prototype, not a separate tree DP with
+independently cached child tables.
+
+Compare against the source snapshot, including count-only and replay modes,
+and test separator orders directly against exhaustive small-model optima.
+Record separator sizes, dispatch counts, and projected work on Expert boards.
+Run full sequential baseline/changed/changed/baseline `--benchmark` timings
+with default warm-ups and repeats. Also compare timings on boards where
+separator dispatch occurs. Retain only a measurable overall improvement;
+otherwise restore the solver source and stop this optimization experiment.
+Artifacts live outside version control in `%TEMP%\doms-separators-20261021`.
+
+### Results: reverted; no measurable speed improvement
+
+Both production builds used MSYS2 UCRT64 GCC with identical
+`-std=c++17 -O3 -DNDEBUG -pthread` optimization flags. The changed build
+also enabled `-Wall -Wextra -Wpedantic` and compiled without diagnostics.
+Four plain `--benchmark` invocations ran sequentially in A/B/B/A order,
+without overlapping compilation or solver jobs from this session. Each
+used one thread, a successful high-priority request, 100 warm-up boards per
+fixed set, and three timed repeats. Cells sum solve seconds over each
+fixed set's three repeats:
+
+| Fixed Expert set | Baseline 1 | Changed 1 | Changed 2 | Baseline 2 |
+| --- | ---: | ---: | ---: | ---: |
+| 1 | 43.682951 | 43.521858 | 43.578475 | 42.346856 |
+| 2 | 42.693892 | 42.359534 | 42.170746 | 41.060873 |
+| 3 | 41.445897 | 41.192378 | 40.768261 | 40.298917 |
+| Total solve seconds | 127.822740 | 127.073770 | 126.517482 | 123.706646 |
+
+Mean solve time was **125.764693 s baseline versus 126.795626 s changed**,
+a **0.82% slowdown**. The first adjacent pair favored the prototype by
+0.59%, while the second favored baseline by 2.27%. Mean CPU times were
+124.945313 s baseline and 125.882813 s changed. Timing drift is larger than
+the first apparent gain; these runs do not demonstrate a speed improvement.
+Peak memory was not measured.
+
+The separate diagnostic sample used the first 300 Expert boards from the
+first fixed seed. Their baseline estimated total widths ranged from 26 to
+47 (mean 37.11). Decomposition found splits on 42 boards, including 32 with
+nonempty separators of size four through eight. Only seven boards selected
+a separator order; all seven used empty separators (disconnected regions),
+and none reduced peak estimated width. The nonempty separators failed to
+improve the existing order ranking. Linearizing these trees does not realize
+the potential savings of independently cached child tables.
+
+After all full benchmarks, a focused harness timed two solves per build per
+diagnostic board, alternating A/B then B/A within each board. It measured
+the complete solve, including reduction and ordering, on prebuilt models:
+
+| Diagnostic cohort | Boards | Baseline seconds | Changed seconds |
+| --- | ---: | ---: | ---: |
+| All wide boards | 300 | 8.648490 | 8.801600 |
+| Boards selecting separator orders | 7 | 0.137271 | 0.137906 |
+
+The wide sample was 1.77% slower overall. The seven dispatched boards were
+0.46% slower in this small sample; that difference is too small to establish
+a cohort-specific gain or regression. Neither measurement supports retaining
+the prototype.
+
+- All four full benchmarks passed unchanged board, 3BV, and optimal-click
+  references: 36,000 timed solves and 1,200 warm-ups on 3,000 distinct boards.
+- An assertion-enabled temporary harness tested 120 synthetic models with
+  twelve through fourteen candidates, including graph edges, zero propagation,
+  shared mine/base scopes, empty scopes, disconnected regions, and small
+  nonempty separators. Exhaustive evaluation covered 1,146,880 candidate sets.
+  Baseline orders and all 392 generated separator orders matched the exact
+  minimum; every generated order was a complete candidate permutation.
+  Eighteen cases exercised the factor-mask path with more than 64 active bits.
+- Thirty-six full-solver comparisons matched optimal counts across three
+  standard difficulties, seeds 1, 42, 100, 2026, 123456, and 8675309, and both
+  solve modes. All eighteen changed replays passed legal-action validation.
+- All seven dispatched diagnostic boards also matched baseline optimal counts
+  in count-only and replay modes, with valid replay actions.
+
+The complete solver change was reverted, and no follow-on optimization was
+attempted. This result applies to the bounded separator search and serial
+frontier composition prototype; it does not measure a separate tree DP with
+cached child tables. Source snapshots, measured executables, temporary
+harnesses/scripts, diagnostic outputs, raw benchmark logs, and `results.json`
+remain in the artifact directory above. `doms.exe` was restored from the
+measured baseline executable; source and binary restoration were checked by
+SHA-256. Benchmark reference data is unchanged. Only the experiment plan and
+results remain as tracked edits.
+
+## Experiment: bounded chord replacement with joint cost compensation
+
+Extend candidate reduction only after existing reductions reach a fixed point.
+For adjacent victim/replacement chords, enumerate selections in the union of
+victim propagation neighbors and asymmetric mine/base factor scopes. Calculate
+the exact flag and uncovered-base cost change, and bound extra seed clicks by
+the number of selected local components touching the victim but not the
+replacement. Check both replacement-absent (swap) and replacement-present
+(delete) cases. Common factors cancel; external connections can only reduce
+the connectivity bound. This admits compensation between coverage, flags,
+and connectivity without changing the optimal objective.
+
+Limit the local set to 14 candidates and proof recursion to 8,192 nodes;
+exhaustion means no certificate. Existing reductions run first to limit proof
+overhead. Certificates quantify over all selections, so remain valid under
+subsequent restrictions. Benchmark references remain unchanged.
+
+Validate certificates against exhaustive synthetic objectives and complete
+baseline/changed solver counts and replays. Run sequential plain
+`--benchmark` baseline/changed/changed/baseline measurements. Retain only a
+measurable improvement; otherwise restore the complete solver change and stop.
+Preserve pre-existing documentation edits. Temporary artifacts are outside
+version control in `%TEMP%\doms-trade-swap-20261021`.
+
+### Results: reverted; clear runtime regression
+
+Both builds used MSYS2 UCRT64 GCC with identical optimization flags
+`-std=c++17 -O3 -DNDEBUG -pthread`; the changed build additionally enabled
+`-Wall -Wextra -Wpedantic` and compiled without diagnostics. Complete plain
+`--benchmark` runs were sequential baseline/changed, each with one thread,
+a successful high-priority request, 100 warm-up boards per set, and three
+timed repeats. No other compilation or solver job from this session overlapped
+these two measurements. Cells sum the three repeats for each fixed set:
+
+| Fixed Expert set | Baseline solve seconds | Changed solve seconds |
+| --- | ---: | ---: |
+| 1 | 42.628731 | 79.865410 |
+| 2 | 41.340146 | 79.869464 |
+| 3 | 40.296800 | 77.470152 |
+| Total | 124.265677 | 237.205026 |
+
+The prototype was **90.89% slower**, with regression in every set and repeat.
+CPU time increased from 123.640625 s to 235.765625 s. This clear regression
+justified stopping the planned A/B/B/A sequence early: the second changed
+invocation had started automatically and was terminated; its partial data
+is excluded. The final baseline invocation was not run. The complete solver
+change was reverted, and no follow-on optimization was attempted.
+
+- Both complete benchmarks passed unchanged board, 3BV, and optimal-click
+  references: 18,000 timed solves and 600 warm-ups on 3,000 distinct boards.
+- An assertion-enabled temporary harness tested 1,200 seeded synthetic models
+  with eight through twelve candidates, arbitrary graph edges, zero-scope
+  propagation, shared/empty factor scopes, and disconnected selections.
+  All 2,691 accepted replacement certificates, including 1,477 not accepted
+  by the existing swap rule, passed 1,918,080 exhaustive transformed-selection
+  objective checks. Exhaustive optimum evaluation also matched before and
+  after complete candidate reduction on all 1,200 models.
+- Thirty-six full-solver comparisons matched optimal click counts across
+  three standard difficulties, seeds 1, 42, 100, 2026, 123456, and 8675309,
+  and both count-only and replay modes. All eighteen changed replays passed
+  built-in legal-action validation. Exact replay choices need not match.
+- Across the six Expert smoke-test boards, remaining candidates decreased
+  from 1,115 to 1,057, but this reduction did not pay for proof-search overhead.
+
+The certificate combines exact signed asymmetric factor costs with an upper
+bound on additional component seeds; the search exhausts all relevant local
+selections and checks both replacement-selected states. Oversize neighborhoods,
+counterexamples, or budget exhaustion retain the candidate. A full binary
+search on twelve local candidates fits the 8,192-node budget; thirteen or
+fourteen cannot produce a certificate within it. Correctness evidence supports
+the conservative proof, but performance does not support this implementation.
+
+Baseline/changed source snapshots, measured executables, the temporary proof
+harness, solver JSON/replay outputs, comparison script, raw logs, and timing
+summaries remain in `%TEMP%\doms-trade-swap-20261021`. The pre-existing plan
+edits were preserved. Source restoration and `doms.exe` restoration from the
+measured baseline executable were verified by SHA-256. No benchmark reference
+or maintained test source changed.
+
+
+## Experiment: build zero-opening propagation cliques with bitset unions
+
+Replace pairwise propagation-edge insertion for each zero-opening scope with
+one candidate mask unioned into each member's propagation row. Clear self
+bits after all unions. Graph edges and mine/base factor relations are unchanged.
+This constructs exactly the same neighbor sets, including overlapping scopes,
+so candidate reductions, ordering, objective, pruning, and search limits remain
+unchanged. Per opening, work changes from O(k^2) edge insertions to
+O(ceil(q/64) + k * ceil(q/64)) word operations for k members and q candidates.
+Small scopes may cost more; the full benchmark decides acceptance.
+
+Preserve the existing documentation changes. Build baseline and changed code
+with MSYS2 UCRT64 and identical C++17 optimization flags. Compare actual
+relation builders on standard and synthetic models, then compare full solver
+counts, replay actions, and pruning counters. Run sequential plain
+`--benchmark` in baseline/changed/changed/baseline order. Retain only a
+measurable improvement; otherwise revert this solver change and stop.
+Temporary artifacts: `%TEMP%\doms-opening-cliques-20261021`.
+
+### Results: retained
+
+Both builds used MSYS2 UCRT64 GCC and identical optimization flags
+`-std=c++17 -O3 -DNDEBUG -pthread`. The changed build additionally enabled
+`-Wall -Wextra -Wpedantic` and compiled without diagnostics. Four plain
+`--benchmark` invocations ran sequentially in A/B/B/A order, without other
+compilation or solver jobs from this session overlapping measurements.
+Each used one thread, high priority (successful), 100 warm-up boards per
+fixed set, and three timed repeats. Cells sum each set's three repeats:
+
+| Fixed Expert set | Baseline 1 | Changed 1 | Changed 2 | Baseline 2 |
+| --- | ---: | ---: | ---: | ---: |
+| 1 | 42.832162 | 42.806802 | 43.243734 | 43.315103 |
+| 2 | 41.763187 | 41.038656 | 41.333634 | 42.259643 |
+| 3 | 41.168986 | 39.911925 | 40.807120 | 40.843142 |
+| Total solve seconds | 125.764335 | 123.757383 | 125.384488 | 126.417888 |
+
+Mean solve time decreased from **126.091111 s to 124.570936 s (1.21%)**.
+Both adjacent pairs improved (1.60% and 0.82%), as did all six corresponding
+set totals. Mean CPU time decreased from 125.164062 s to 123.757812 s
+(1.12%). This is a modest local gain from two invocations per build;
+some per-set differences are small. These measurements support retention on
+this workload without guaranteeing a gain on every board. Peak memory was
+not measured. The extra scratch mask uses ceil(q/64) words.
+
+- All four full benchmarks passed unchanged board, 3BV, and optimal-click
+  references: 36,000 timed solves and 1,200 warm-ups on 3,000 distinct boards.
+- An assertion-enabled temporary differential harness compared the actual
+  original and changed relation builders on 3,000 standard boards (1,000 per
+  difficulty), before and after reduction: 6,000 models. Propagation, mine,
+  and base bitsets matched exactly. Another 3,000 synthetic models covered
+  empty/singleton and overlapping scopes, dense cliques, graph edges, and
+  candidate counts across 64-bit word boundaries; all bitsets matched.
+- All non-timing JSON fields, exact replay actions, and four state/pruning
+  counter lines matched across 36 complete solver comparisons: three standard
+  difficulties; seeds 1, 42, 100, 2026, 123456, and 8675309; count-only and replay
+  modes. All 18 changed replays passed built-in legal-action validation.
+- The clique union followed by self-bit clearing constructs exactly the same
+  relation as pairwise insertion. No candidate certificate, ordering tie break,
+  objective, search limit, or benchmark reference changed.
+
+Source snapshots, measured executables, the temporary differential harness,
+solver JSON/profile outputs, runner, raw logs, and `results.json` remain in
+`%TEMP%\doms-opening-cliques-20261021`, outside version control. Existing
+documentation changes were preserved. `doms.exe` is the measured changed build;
+source and executable copies were checked by SHA-256. `git diff --check` passed.
+
+## Experiment: visit only populated words in opening clique unions
+
+The retained clique-union builder clears and scans all candidate-mask words
+for every zero-opening scope. Track which words the scope populates, union
+only those words into each member's propagation row, then clear those scratch
+words. The resulting neighbor masks are identical, while small scopes avoid
+scanning words they cannot contain. No objective, ordering, reduction rule,
+or search limit changes.
+
+Build with the repository's MSYS2 UCRT64 C++17 `-O3 -DNDEBUG -pthread`
+command and compare sequential plain `--benchmark` runs. Keep only a
+measurable improvement; otherwise restore the source and stop. Existing
+workspace edits are included in the baseline.
+
+### Results: reverted; slower
+
+The baseline and changed builds both passed all fixed board, 3BV, and
+optimal-click references in plain `--benchmark` (9,000 timed solves plus
+warm-ups per invocation). The baseline total solve time was 127.829432 s.
+Two changed invocations totaled 132.761362 s and 132.026687 s, averaging
+132.394025 s, or 3.57% slower than baseline. Repeat-to-repeat variation was
+material, but both changed totals were slower. The candidate change was
+reverted and no follow-on optimization was attempted.
+
+The change altered only scratch-mask assembly; full reference validation
+confirmed the benchmark's optimal click counts remained unchanged. The
+previous working-tree edits were preserved.
+
+## Experiment: incrementally merge dynamic band candidate orders
+
+Dynamic band ordering builds overlapping bands of up to eight sweep lines.
+Each band's ordering is by secondary coordinate, then sweep-line order.
+Build a one-line band from its already sorted line; build each larger band
+by stable-merging the previous band's order with the newly added sorted line.
+On equal secondary coordinates the previous band precedes the added line,
+preserving the original tie break in both forward and reverse sweeps.
+This replaces repeated full-band sorting with linear merging. Width scoring,
+chosen sweep, objective, dominance certificates, and search limits are unchanged.
+
+Include all pre-existing workspace edits in the baseline. Build both versions
+with MSYS2 UCRT64 and identical C++17 optimization flags. Compare actual dynamic
+orders and full solver/replay results. Run sequential plain `--benchmark`
+invocations in baseline/changed/changed/baseline order; retain only a measurable
+improvement, otherwise revert this solver change and stop. Temporary snapshots,
+binaries, harnesses, and logs are outside version control under
+`%TEMP%\doms-band-merge-20261022`.
+
+### Results: retained
+
+Both builds used MSYS2 UCRT64 GCC and identical
+`-std=c++17 -O3 -DNDEBUG -pthread` flags. Four plain `--benchmark`
+invocations ran sequentially in A/B/B/A order, with no compilation or other
+solver jobs from this session overlapping measurements. Each used one thread,
+high priority (successful), 100 warm-up boards per set, and three timed repeats.
+Cells sum each fixed set's three repeats:
+
+| Fixed Expert set | Baseline 1 | Changed 1 | Changed 2 | Baseline 2 |
+| --- | ---: | ---: | ---: | ---: |
+| 1 | 42.679663 | 39.005804 | 39.105931 | 42.659143 |
+| 2 | 41.386757 | 37.758904 | 37.955838 | 41.290777 |
+| 3 | 40.258682 | 36.669017 | 36.689588 | 40.270038 |
+| Total solve seconds | 124.325102 | 113.433725 | 113.751357 | 124.219958 |
+
+Mean solve time decreased from **124.272530 s to 113.592541 s (8.59%)**.
+Both adjacent pairs improved (8.76% and 8.43%), as did all six corresponding set totals.
+Mean CPU time decreased from 123.382812 s to 112.695312 s (8.66%).
+These local measurements support retention on the fixed Expert workload;
+performance on other workloads and peak memory were not measured.
+
+- All four benchmarks passed unchanged board, 3BV, and optimal-click references:
+  36,000 timed solves and 1,200 warm-ups on 3,000 distinct Expert boards.
+- A temporary C++ differential harness compared the actual original and changed
+  dynamic band functions on 300 seeded standard boards, before and after
+  candidate reduction, and 200 synthetic sparse models with dimensions up to
+  32x24. All 3,200 complete orders and band partitions matched across both
+  orientations and both sweep directions. Sparse models cover empty lines
+  and empty candidate sets.
+- All non-timing JSON fields, exact replay actions, and four state/pruning
+  counter lines matched across 36 full-solver comparisons: three standard
+  difficulties; seeds 1, 42, 100, 2026, 123456, and 8675309; count-only and
+  replay modes. All 18 changed replays passed built-in legal-action validation.
+- Stable merging preserves the original secondary-coordinate/sweep-line
+  lexicographic order. Inductively, every band, width estimate, selected
+  partition, and subsequent search is unchanged. No objective, dominance
+  certificate, search limit, or benchmark reference changed.
+
+Source snapshots, measured executables, the temporary differential harness,
+solver JSON/profile outputs, runner, and raw benchmark logs/results are
+retained in the artifact directory above. Existing workspace edits were
+preserved. `doms.exe` is the measured changed build, verified by SHA-256.
+`git diff --check` passed.
+
+
+## Experiment: reuse dynamic-band width-scoring workspace
+
+Dynamic band scoring previously rebuilt a complete trial order and allocated
+an inverse permutation and two endpoint arrays for every overlapping band.
+Extract the scorer to accept an inverse permutation and reusable endpoint
+buffers. Initialize the plain sweep positions once, reset them once per band
+start, and overwrite only positions inside each growing band. Reuse the two
+endpoint buffers throughout the sweep. The ordinary width-estimate wrapper
+uses the same scorer. Graph intervals now accumulate in candidate-ID order;
+integer endpoint sums are independent of visitation order.
+
+Every inverse position and endpoint sum is identical to the previous trial
+permutation. Width scores, band partitions, chosen orders, and subsequent
+exact search must remain unchanged. No objective, dominance certificate,
+search limit, or benchmark reference changes. Preserve all pre-existing edits.
+
+Build baseline and changed versions with MSYS2 UCRT64 C++17 using identical
+`-O3 -DNDEBUG -pthread` flags. Compare actual original and changed dynamic
+orders, partitions, and width estimates, plus full solver counts and replays.
+Run sequential plain `--benchmark` invocations in baseline/changed/changed/
+baseline order. Retain only measurable improvement; otherwise revert this
+experiment's solver changes and stop. Temporary artifacts are outside version
+control in `%TEMP%\doms-band-workspace-20261022`.
+
+### Results: retained
+
+Both builds used MSYS2 UCRT64 GCC with identical optimization flags
+`-std=c++17 -O3 -DNDEBUG -pthread`. The changed build additionally enabled
+`-Wall -Wextra -Wpedantic` and compiled without diagnostics. Four plain
+`--benchmark` invocations ran sequentially in A/B/B/A order, without other
+compilation or solver jobs from this session overlapping measurements.
+Each used one thread, high priority (successful), 100 warm-up boards per set,
+and three timed repeats. Cells sum each fixed set's three repeats:
+
+| Fixed Expert set | Baseline 1 | Changed 1 | Changed 2 | Baseline 2 |
+| --- | ---: | ---: | ---: | ---: |
+| 1 | 39.395651 | 38.436815 | 38.606641 | 40.410569 |
+| 2 | 38.129019 | 37.067324 | 36.749328 | 38.350903 |
+| 3 | 36.817844 | 35.110336 | 35.925814 | 37.230505 |
+| Total solve seconds | 114.342514 | 110.614475 | 111.281783 | 115.991977 |
+
+Mean solve time decreased from **115.167245 s to 110.948129 s (3.66%)**.
+Both adjacent pairs improved (3.26% and 4.06%), as did all six
+corresponding set totals. Mean CPU time decreased from 114.289062 s to
+110.093750 s (3.67%). These are local measurements from two
+invocations per build; other workloads and peak memory were not measured.
+
+- All four benchmarks passed unchanged board, 3BV, and optimal-click references:
+  36,000 timed solves and 1,200 warm-ups on 3,000 distinct Expert boards.
+- An assertion-enabled temporary C++ harness compared the actual original
+  and changed dynamic-band functions on 300 seeded standard boards, before
+  and after reduction, plus 200 synthetic sparse models with dimensions up
+  to 32x24. All 3,200 complete orders and band partitions matched across both
+  orientations and both sweep directions. Full and partial width estimates
+  also matched the original scorer. Sparse models include empty candidate
+  sets and empty lines.
+- All non-timing JSON fields, exact replay actions, and four state/pruning
+  counter lines matched in 36 full-solver comparisons: three standard
+  difficulties; seeds 1, 42, 100, 2026, 123456, and 8675309; count-only and
+  replay modes. All 18 changed replays passed built-in legal-action validation.
+- Resetting inverse positions at each band start and rewriting every member
+  of each growing band reconstructs exactly the original trial permutation.
+  Reused endpoint arrays are cleared before each score. Integer interval
+  additions commute, preserving all scores despite graph traversal order.
+  No objective, dominance certificate, search limit, or reference changed.
+
+Source snapshots, measured executables, the temporary differential harness,
+solver JSON/profile outputs, runner, raw benchmark logs, and `results.json`
+remain in `%TEMP%\doms-band-workspace-20261022`, outside version control.
+Pre-existing workspace edits were preserved. `doms.exe` is the measured
+changed build, verified by SHA-256. `git diff --check` passed.
+
+## Experiment: filter dynamic-band width contributions by sweep extent
+
+Precompute sweep-line extents for each graph vertex's live interval and each
+opening/factor scope. For each band start, retain only contributions that can
+intersect the largest band considered at that start. Reuse that selection for
+all of its band ends. The scorer still computes exact inverse-position
+intervals for retained contributions, using the existing endpoint sums.
+
+An excluded graph vertex either starts after the largest band or has itself
+and all neighbors before the band. An excluded scope lies wholly before or
+wholly after the band. Such contributions are zero at every scored cut.
+Scopes that span distant lines are included; no locality assumption is made.
+Same-line and boundary contributions are conservatively retained. All width
+scores, order choices, objective, pruning certificates, and search limits
+must remain identical. Preserve all pre-existing workspace edits.
+
+Build baseline and changed sources with MSYS2 UCRT64 C++17 and identical
+`-O3 -DNDEBUG -pthread` flags. Compare every band score and final dynamic
+orders/partitions on standard and synthetic models; compare full counts,
+replays, and pruning counters. Run sequential plain `--benchmark` invocations
+in baseline/changed/changed/baseline order. Retain only measurable overall
+improvement; otherwise restore this experiment's solver changes and stop.
+Temporary artifacts remain outside version control in
+`%TEMP%\doms-band-filter-20261022`.
+
+### Results: retained
+
+Baseline and changed builds used MSYS2 UCRT64 GCC with identical
+`-std=c++17 -O3 -DNDEBUG -pthread` optimization flags. The changed build
+also enabled `-Wall -Wextra -Wpedantic` and compiled without diagnostics.
+Four plain `--benchmark` invocations ran sequentially in A/B/B/A order,
+without overlapping compilation or other solver jobs from this session.
+Each used one thread, high priority (successful), 100 warm-up boards per set,
+and three timed repeats. Cells sum each fixed set's three repeats:
+
+| Fixed Expert set | Baseline 1 | Changed 1 | Changed 2 | Baseline 2 |
+| --- | ---: | ---: | ---: | ---: |
+| 1 | 39.159772 | 37.935370 | 36.616375 | 37.529207 |
+| 2 | 38.195458 | 36.138098 | 35.377854 | 36.132752 |
+| 3 | 36.397194 | 35.302525 | 34.217702 | 35.151292 |
+| Total solve seconds | 113.752424 | 109.375993 | 106.211931 | 108.813251 |
+
+Mean solve time decreased from **111.282838 s to 107.793962 s (3.14%)**.
+Both adjacent pairs improved (3.85% and 2.39%), as did all six corresponding
+set totals. Mean CPU time decreased from 110.507813 s to 107.070313 s
+(3.11%). There is visible timing drift; these two runs per build support a
+modest local improvement on this workload, without establishing gains on
+every board or other workloads. Peak memory was not measured.
+
+- All four benchmarks passed unchanged board, 3BV, and optimal-click
+  references: 36,000 timed solves and 1,200 warm-ups on 3,000 distinct boards.
+- An assertion-enabled temporary C++ harness compared every band score
+  against the original complete scorer, plus all 3,200 final dynamic orders
+  and band partitions. It used 300 seeded standard boards before and after
+  reduction and 200 synthetic models with dimensions up to 32x24, in both
+  orientations and both sweep directions. Synthetic cases included empty
+  candidate sets/lines, empty scopes, and arbitrary long-range graph edges
+  and scopes. Full and partial ordinary width estimates also matched.
+- All non-timing JSON fields, exact replay actions, and four state/pruning
+  counter lines matched in 36 full solver comparisons: three difficulties;
+  seeds 1, 42, 100, 2026, 123456, and 8675309; count-only and replay modes.
+  All 18 changed replays passed built-in legal-action validation.
+- Excluded contributions vanish on every scored cut. Retained contributions
+  use the original exact interval calculation. No objective, dominance
+  certificate, search limit, or benchmark reference changed.
+
+Source snapshots, measured builds, the temporary differential harness,
+solver JSON/profile comparisons, runner, raw benchmark logs, and
+`results.json` remain in `%TEMP%\doms-band-filter-20261022`, outside version
+control. All pre-existing edits were preserved. `doms.exe` was rebuilt from
+the retained source. `git diff --check` passed.
