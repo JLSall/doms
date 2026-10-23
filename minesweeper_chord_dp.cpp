@@ -56,6 +56,21 @@ namespace fs = std::filesystem;
 constexpr std::string_view LLAMA_ALPHABET = "0123456789abcdefghijklmnopqrstuv";
 constexpr int PROGRESS_INTERVAL = 10;
 
+// Portable builds otherwise call libgcc for every 64-bit population count.
+// Sum bit pairs, nibbles, then bytes in parallel and collect the byte totals.
+// Keep the intrinsic when the compilation target has a hardware instruction.
+static inline int population_count(uint64_t bits) {
+#if defined(__POPCNT__) || defined(__aarch64__)
+    return __builtin_popcountll(bits);
+#else
+    bits -= (bits >> 1) & UINT64_C(0x5555555555555555);
+    bits = (bits & UINT64_C(0x3333333333333333)) +
+           ((bits >> 2) & UINT64_C(0x3333333333333333));
+    bits = (bits + (bits >> 4)) & UINT64_C(0x0f0f0f0f0f0f0f0f);
+    return static_cast<int>((bits * UINT64_C(0x0101010101010101)) >> 56);
+#endif
+}
+
 struct UserError : std::runtime_error {
     using std::runtime_error::runtime_error;
 };
@@ -1029,13 +1044,13 @@ static bool left_click_dominated_candidate(const CandidateRelations& relations,
     auto search = [&](auto&& self, uint64_t available, int chosen,
                       uint64_t covered) -> void {
         if (exceeds_threshold) return;
-        best = std::max(best, chosen - __builtin_popcountll(covered));
+        best = std::max(best, chosen - population_count(covered));
         if (best > threshold) {
             exceeds_threshold = true;
             return;
         }
-        const int optimistic = chosen + __builtin_popcountll(available) -
-                               __builtin_popcountll(covered);
+        const int optimistic = chosen + population_count(available) -
+                               population_count(covered);
         if (optimistic <= best || !available) return;
 
         int pivot = __builtin_ctzll(available);
@@ -1045,7 +1060,7 @@ static bool left_click_dominated_candidate(const CandidateRelations& relations,
             const int vertex = __builtin_ctzll(scan);
             scan &= scan - 1;
             const int current_degree =
-                __builtin_popcountll(local_edges[vertex] & available);
+                population_count(local_edges[vertex] & available);
             if (current_degree > pivot_degree) {
                 pivot = vertex;
                 pivot_degree = current_degree;
@@ -1678,6 +1693,12 @@ struct OrderRequest {
 };
 
 static OrderRequest parse_order_request(const std::string& name) {
+    if (name.size() > 8 && name.compare(name.size() - 8, 8, "-windows") == 0) {
+        const auto base = name.substr(0, name.size() - 8);
+        if (base == "auto" || base.find("-windows") != std::string::npos)
+            throw UserError("invalid --order value: " + name);
+        return parse_order_request(base);
+    }
     if (name == "auto") return {OrderRequest::Kind::Auto, "", false, 1, {}};
     OrderRequest result{OrderRequest::Kind::Plain, "", false, 1, {}};
     size_t offset;
@@ -1769,9 +1790,160 @@ static std::vector<int> explicit_band_order_indices(const Model& model,
     return order;
 }
 
-static std::pair<Model, std::string> choose_order(const Model& model,
+// Refine a spatial sweep in bounded windows. Every permutation is a valid exact
+// DP order. The guard limits planning work only, never the solution search.
+static std::pair<int, double> window_order_score(
+        const Model& model, const std::vector<int>& order) {
+    const int q = static_cast<int>(order.size());
+    std::vector<int> inverse(q), graph_delta(q + 1), factor_delta(q + 1);
+    for (int i = 0; i < q; ++i) inverse[order[i]] = i;
+    width_estimate_from_inverse(model, inverse, 0, q, graph_delta, factor_delta);
+    int graph = 0, factors = 0, peak = 0;
+    double work = 0;
+    for (int i = 0; i < q; ++i) {
+        graph += graph_delta[i]; factors += factor_delta[i];
+        const int width = 3 * graph + 2 * factors;
+        peak = std::max(peak, width);
+        work += std::exp2(width / 8.0);
+    }
+    return {peak, work};
+}
+
+static std::vector<int> refine_window_order(const Model& model,
+                                          std::vector<int> order,
+                                          int window = 16) {
+    const int q = static_cast<int>(order.size());
+    auto score = window_order_score(model, order);
+    // Wider windows reduce frontier states on the fixed large boards; include
+    // their extra planning cost when benchmarking changes to this bound.
+    for (int pass = 0; pass < 4; ++pass) {
+        std::vector<int> inverse(q);
+        for (int i = 0; i < q; ++i) inverse[order[i]] = i;
+        struct Block { int begin, end; std::vector<int> width; };
+        std::vector<Block> blocks;
+        int global_peak = 0;
+        for (int begin = 0; begin < q;) {
+            const int end = std::min(q, begin +
+                (begin == 0 && pass % 2 ? window / 2 : window));
+            const int size = 1 << (end - begin), full = size - 1;
+            std::vector<int> direct(size), complement(size);
+            int constant = 0;
+            auto classify = [&](const std::vector<int>& scope) {
+                int mask = 0; bool before = false, after = false;
+                for (int v : scope) {
+                    const int p = inverse[v];
+                    if (p < begin) before = true;
+                    else if (p >= end) after = true;
+                    else mask |= 1 << (p - begin);
+                }
+                return std::tuple<int, bool, bool>{mask, before, after};
+            };
+            auto hyperedge = [&](const auto& scope, int weight) {
+                const auto [mask, before, after] = classify(scope);
+                if (!mask && !before && !after) return;
+                constant += weight;
+                if (!before) complement[mask] -= weight;
+                if (!after) direct[mask] -= weight;
+            };
+            for (int v = 0; v < q; ++v) {
+                if (inverse[v] >= end) continue;
+                const auto [mask, before, after] = classify(model.graph[v]);
+                (void)before;
+                if (inverse[v] < begin) {
+                    constant += 3;
+                    if (!after) direct[mask] -= 3;
+                } else {
+                    const int self = 1 << (inverse[v] - begin);
+                    direct[self] += 3;
+                    if (!after) direct[mask | self] -= 3;
+                }
+            }
+            for (const auto& scope : model.zero_scopes) hyperedge(scope, 3);
+            for (const auto& scope : model.mine_scopes) hyperedge(scope, 2);
+            for (const auto& scope : model.base_scopes) hyperedge(scope, 2);
+            subset_zeta(direct); subset_zeta(complement);
+            Block block{begin, end, std::vector<int>(size)};
+            std::vector<int> peak(size, std::numeric_limits<int>::max());
+            for (int mask = 0; mask < size; ++mask)
+                block.width[mask] = constant + direct[mask] + complement[full ^ mask];
+            peak[0] = block.width[0];
+            for (int mask = 1; mask < size; ++mask) {
+                for (unsigned bits = mask; bits; bits &= bits - 1) {
+                    const unsigned bit = bits & -bits;
+                    peak[mask] = std::min(peak[mask],
+                        std::max(peak[mask ^ bit], block.width[mask]));
+                }
+            }
+            global_peak = std::max(global_peak, peak.back());
+            blocks.push_back(std::move(block));
+            begin = end;
+        }
+        std::vector<double> increments(global_peak + 1);
+        for (int w = 0; w <= global_peak; ++w) increments[w] = std::exp2(w / 8.0);
+        std::vector<int> optimized;
+        optimized.reserve(q);
+        for (const auto& block : blocks) {
+            const int size = static_cast<int>(block.width.size());
+            std::vector<double> cost(size, std::numeric_limits<double>::infinity());
+            std::vector<unsigned> parent(size);
+            cost[0] = 0;
+            for (int mask = 1; mask < size; ++mask) {
+                if (block.width[mask] > global_peak) continue;
+                const double increment = increments[block.width[mask]];
+                for (unsigned bits = mask; bits; bits &= bits - 1) {
+                    const unsigned bit = bits & -bits;
+                    const double next = cost[mask ^ bit] + increment;
+                    if (next < cost[mask]) { cost[mask] = next; parent[mask] = bit; }
+                }
+            }
+            std::vector<int> reversed;
+            for (unsigned mask = size - 1; mask;) {
+                const unsigned bit = parent[mask];
+                if (!bit) throw std::logic_error("window order reconstruction failed");
+                reversed.push_back(order[block.begin + __builtin_ctz(bit)]);
+                mask ^= bit;
+            }
+            optimized.insert(optimized.end(), reversed.rbegin(), reversed.rend());
+        }
+        const auto next_score = window_order_score(model, optimized);
+        if (next_score < score) { order = std::move(optimized); score = next_score; }
+    }
+    return order;
+}
+
+// Budget subset planning against the same frontier-work estimate used to
+// assess its result. This is a deterministic effort heuristic, not a time
+// limit: explicit order names must reproduce their permutations.
+static int automatic_window_size(const Model& model, const std::vector<int>& order) {
+    const size_t q = order.size();
+    if (q < 8) return 0;
+    const double budget = window_order_score(model, order).second / 4;
+    size_t scope_items = q;
+    for (const auto& neighbors : model.graph) scope_items += neighbors.size();
+    for (const auto* scopes : {&model.zero_scopes, &model.mine_scopes, &model.base_scopes})
+        for (const auto& scope : *scopes) scope_items += scope.size();
+    int chosen = 0;
+    for (int window = 8; window <= 16 && size_t(window) <= q; ++window) {
+        const double effort = 8.0 * q * (uint64_t{1} << window) +
+            4.0 * ((q + window - 1) / window + 1) * scope_items;
+        if (effort <= budget) chosen = window;
+    }
+    return chosen;
+}
+
+static std::pair<Model, std::string> choose_order_from_plan(const Model& model,
                                                    const std::string& requested,
                                                    std::optional<int> band_size) {
+    if (requested.size() > 8 &&
+        requested.compare(requested.size() - 8, 8, "-windows") == 0) {
+        parse_order_request(requested);
+        auto [base, name] = choose_order_from_plan(model, requested.substr(0, requested.size() - 8), band_size);
+        std::vector<int> identity(base.candidates.size());
+        std::iota(identity.begin(), identity.end(), 0);
+        const int window = automatic_window_size(base, identity);
+        if (window) identity = refine_window_order(base, std::move(identity), window);
+        return {ordered_model(base, identity), name + "-windows"};
+    }
     if (requested != "auto") {
         const OrderRequest order = parse_order_request(requested);
         if (band_size && order.kind != OrderRequest::Kind::Plain) {
@@ -1893,7 +2065,32 @@ static std::pair<Model, std::string> choose_order(const Model& model,
                    std::get<0>(b.estimate),
                    std::get<3>(b.estimate), b.name};
     });
+    const int window = band_size ? 0 : automatic_window_size(model, best->order);
+    if (window) {
+        auto refined = refine_window_order(model, best->order, window);
+        const bool changed = refined != best->order;
+        return {ordered_model(model, refined), best->name + (changed ? "-windows" : "")};
+    }
     return {ordered_model(model, best->order), best->name};
+}
+
+static std::pair<Model, std::string> choose_order(const Model& model,
+                                                const std::string& requested,
+                                                std::optional<int> band_size) {
+    // Planning counts zero regions as connectivity, and only numbered 3BV
+    // targets as coverage factors, matching the mandatory-zero DP. Keep the
+    // physical objective intact in the model returned to the solver.
+    Model planning_model = model;
+    for (size_t z = 0; z < planning_model.zero_scopes.size(); ++z)
+        planning_model.base_scopes[z].clear();
+    auto [planned, name] = choose_order_from_plan(planning_model, requested, band_size);
+    std::vector<int> candidate_index(model.width * model.height, -1);
+    for (int i = 0; i < static_cast<int>(model.candidates.size()); ++i)
+        candidate_index[model.candidates[i]] = i;
+    std::vector<int> order;
+    order.reserve(planned.candidates.size());
+    for (int cell : planned.candidates) order.push_back(candidate_index[cell]);
+    return {ordered_model(model, order), name};
 }
 
 // Six words cover chosen-chord histories on standard boards and most 30x20
@@ -1955,14 +2152,14 @@ static bool test_bit(const Bits& bits, int position) {
 
 static int bit_count(const Bits& bits) {
     int count = 0;
-    for (size_t i = 0; i < bits.size(); ++i) count += __builtin_popcountll(bits[i]);
+    for (size_t i = 0; i < bits.size(); ++i) count += population_count(bits[i]);
     return count;
 }
 
 static int bit_count_new_and(const Bits& member, const Bits& old, const Bits& filter) {
     int count = 0;
     for (size_t i = 0; i < member.size(); ++i) {
-        count += __builtin_popcountll(member[i] & ~old[i] & filter[i]);
+        count += population_count(member[i] & ~old[i] & filter[i]);
     }
     return count;
 }
@@ -1994,9 +2191,9 @@ template <>
 struct FactorOps<uint64_t> {
     static uint64_t zero(size_t) { return 0; }
     static void set(uint64_t& bits, int position) { bits |= uint64_t{1} << position; }
-    static int count(uint64_t bits) { return __builtin_popcountll(bits); }
+    static int count(uint64_t bits) { return population_count(bits); }
     static int count_new_and(uint64_t member, uint64_t old, uint64_t filter) {
-        return __builtin_popcountll(member & ~old & filter);
+        return population_count(member & ~old & filter);
     }
     static void add(uint64_t& target, uint64_t member) { target |= member; }
     static void retain(uint64_t& target, uint64_t active) { target &= active; }
@@ -2016,7 +2213,7 @@ static bool dominance_penalty_at_most(const Bits& candidate, const Bits& other,
     for (size_t i = 0; i < candidate.size(); ++i) {
         const uint64_t candidate_good = candidate[i] ^ base_mask[i];
         const uint64_t other_good = other[i] ^ base_mask[i];
-        penalty += __builtin_popcountll(other_good & ~candidate_good);
+        penalty += population_count(other_good & ~candidate_good);
         if (penalty > allowance) return false;
     }
     return true;
@@ -2026,21 +2223,21 @@ static bool dominance_penalty_at_most(uint64_t candidate, uint64_t other,
                                       uint64_t base_mask, int allowance) {
     const uint64_t candidate_good = candidate ^ base_mask;
     const uint64_t other_good = other ^ base_mask;
-    return __builtin_popcountll(other_good & ~candidate_good) <= allowance;
+    return population_count(other_good & ~candidate_good) <= allowance;
 }
 
 static std::pair<int, int> factor_hit_counts(const Bits& hits, const Bits& base_mask) {
     int base_hits = 0;
     int total_hits = 0;
     for (size_t word = 0; word < hits.size(); ++word) {
-        base_hits += __builtin_popcountll(hits[word] & base_mask[word]);
-        total_hits += __builtin_popcountll(hits[word]);
+        base_hits += population_count(hits[word] & base_mask[word]);
+        total_hits += population_count(hits[word]);
     }
     return {base_hits, total_hits};
 }
 
 static std::pair<int, int> factor_hit_counts(uint64_t hits, uint64_t base_mask) {
-    return {__builtin_popcountll(hits & base_mask), __builtin_popcountll(hits)};
+    return {population_count(hits & base_mask), population_count(hits)};
 }
 
 static size_t hash_combine(size_t seed, uint64_t value) {
@@ -2664,37 +2861,57 @@ static bool connectivity_exact_quotient(SignatureView coarse,
 template <size_t FixedWords>
 static int connectivity_merge_penalty_impl(SignatureView a,
                                       SignatureView b,
-                                      size_t runtime_words) {
+                                      size_t runtime_words, int maximum_penalty) {
     const size_t words = FixedWords ? FixedWords : runtime_words;
     const int na = static_cast<int>(a.size() / words);
     const int nb = static_cast<int>(b.size() / words);
     if (na + nb > 128) return std::numeric_limits<int>::max();
+    // Eliminate A vertices from the bipartite graph: each nonisolated A
+    // vertex joins all its B neighbors. Isolated A vertices remain separate
+    // groups. This preserves connected components with fewer root lookups.
     std::array<int, 128> parent;
-    std::iota(parent.begin(), parent.begin() + na + nb, 0);
+    std::iota(parent.begin(), parent.begin() + nb, 0);
     auto root = [&](int v) {
         while (parent[v] != v) { parent[v] = parent[parent[v]]; v = parent[v]; }
         return v;
     };
-    int groups = na + nb;
+    int groups = nb;
+    // Equal reach unions and nonempty components exclude isolated A vertices.
+    // Each union increases the final penalty's lower bound by exactly one.
+    if (na - groups > maximum_penalty) return std::numeric_limits<int>::max();
     for (int x = 0; x < na; ++x) {
+        int anchor = -1;
         for (int y = 0; y < nb; ++y) {
             bool overlap = false;
             for (size_t w = 0; w < words; ++w) {
                 if (a[x * words + w] & b[y * words + w]) { overlap = true; break; }
             }
             if (!overlap) continue;
-            const int rx = root(x), ry = root(na + y);
-            if (rx != ry) { parent[rx] = ry; --groups; }
+            const int ry = root(y);
+            if (anchor < 0) anchor = ry;
+            else if (anchor != ry) {
+                parent[ry] = anchor;
+                --groups;
+                if (na - groups > maximum_penalty)
+                    return std::numeric_limits<int>::max();
+                // The caller groups signatures by equal reach union. Every
+                // remaining nonempty A component therefore touches B. Once
+                // all B components are connected, none can add another group.
+                if (groups == 1) return na - 1;
+            }
         }
+        if (anchor < 0) ++groups;
     }
     return na - groups;
 }
 
 static int connectivity_merge_penalty(SignatureView a,
                                       SignatureView b,
-                                      size_t signature_words) {
-    if (signature_words == 1) return connectivity_merge_penalty_impl<1>(a, b, 1);
-    return connectivity_merge_penalty_impl<0>(a, b, signature_words);
+                                      size_t signature_words,
+                                      int maximum_penalty = std::numeric_limits<int>::max()) {
+    if (signature_words == 1)
+        return connectivity_merge_penalty_impl<1>(a, b, 1, maximum_penalty);
+    return connectivity_merge_penalty_impl<0>(a, b, signature_words, maximum_penalty);
 }
 
 template <typename FactorBits, bool TrackChosen>
@@ -2982,7 +3199,7 @@ static size_t prune_dominated(FactorTable<FactorBits, TrackChosen>& table,
             for (size_t offset = 0; offset < signature.size(); offset += signature_words) {
                 int population = 0;
                 for (size_t word = 0; word < signature_words; ++word) {
-                    population += __builtin_popcountll(signature[offset + word]);
+                    population += population_count(signature[offset + word]);
                 }
                 minimum_component_population[id] =
                     std::min(minimum_component_population[id], population);
@@ -3142,9 +3359,15 @@ static size_t prune_dominated(FactorTable<FactorBits, TrackChosen>& table,
             if (!connectivity_exact_quotient(connectivity_pool[target_id],
                                              connectivity_pool[candidate_id],
                                              signature_words)) {
+                // These are the same necessary bounds checked below. Stop
+                // merging as soon as no remaining target can afford the charge.
+                const int maximum_penalty = static_cast<int>(std::min<uint64_t>(
+                    std::min(live_maximum_cost - minimum_cost[candidate_id],
+                             live_maximum_quasi - minimum_quasi[candidate_id]),
+                    maximum_primary - minimum_primary));
                 extra_seeds = connectivity_merge_penalty(
                     connectivity_pool[candidate_id], connectivity_pool[target_id],
-                    signature_words);
+                    signature_words, maximum_penalty);
                 if (extra_seeds <= 0 ||
                     extra_seeds == std::numeric_limits<int>::max() ||
                     minimum_cost[candidate_id] + extra_seeds > live_maximum_cost ||
@@ -3285,6 +3508,7 @@ static Solution construct_solution(const Model& model, const std::vector<int>& s
                                    std::optional<int> expected_clicks = std::nullopt);
 
 struct FactorPlan {
+    bool mandatory_zeros = false;
     std::vector<std::vector<int>> scopes;
     std::vector<uint8_t> is_flag;
     std::vector<int> first;
@@ -3294,12 +3518,15 @@ struct FactorPlan {
     int slot_count = 0;
 };
 
-static FactorPlan make_factor_plan(const Model& model) {
+static FactorPlan make_factor_plan(const Model& model, bool mandatory_zeros = false) {
     FactorPlan plan;
+    plan.mandatory_zeros = mandatory_zeros;
     plan.zero_factor.assign(model.zero_scopes.size(), -1);
     auto add_scopes = [&](const std::vector<std::vector<int>>& source, bool flag) {
         for (size_t source_index = 0; source_index < source.size(); ++source_index) {
             const auto& scope = source[source_index];
+            if (mandatory_zeros && !flag && source_index < model.zero_scopes.size())
+                continue;
             if (scope.empty()) continue;
             const int factor = static_cast<int>(plan.scopes.size());
             plan.scopes.push_back(scope);
@@ -3409,6 +3636,15 @@ static Solution solve_frontier_core(const Model& original_model,
         }
     }
     std::vector<int> contact_order;
+    // Mandatory openings enter before their first neighboring decision, so
+    // their first candidate also needs a contact slot even without a past chord.
+    if (factors.mandatory_zeros) {
+        for (const auto& scope : model.zero_scopes) {
+            if (scope.empty()) continue;
+            for (int candidate : scope)
+                first_contact[candidate] = std::min(first_contact[candidate], scope.front());
+        }
+    }
     for (int candidate = 0; candidate < q; ++candidate) {
         if (first_contact[candidate] < q) contact_order.push_back(candidate);
     }
@@ -3421,7 +3657,11 @@ static Solution solve_frontier_core(const Model& original_model,
     for (int candidate : contact_order) {
         int chosen = -1;
         for (int slot = 0; slot < static_cast<int>(connectivity_slot_last.size()); ++slot) {
-            if (connectivity_slot_last[slot] <= first_contact[candidate]) {
+            // Entering zero components need both the current and future bits
+            // before projection, so they cannot share a slot at this cut.
+            if (connectivity_slot_last[slot] < first_contact[candidate] ||
+                (!factors.mandatory_zeros &&
+                 connectivity_slot_last[slot] == first_contact[candidate])) {
                 chosen = slot;
                 break;
             }
@@ -3463,6 +3703,26 @@ static Solution solve_frontier_core(const Model& original_model,
         std::vector<uint64_t> remaining_border;
     };
     std::vector<std::vector<OpeningPattern>> opening_patterns(q);
+    // An opening always owns a component, whether or not any neighboring
+    // chord has been selected.
+    // This removes its coverage bit and the need for opening absorption.
+    std::vector<std::vector<uint64_t>> entering_zeros(q);
+    std::vector<int> entering_zero_count(q, 0);
+    if (factors.mandatory_zeros) {
+        const size_t words = compact_connectivity ? compact_signature_words : chosen_words;
+        for (const auto& scope : model.zero_scopes) {
+            if (scope.empty()) continue;
+            auto& entering = entering_zeros[scope.front()];
+            const size_t offset = entering.size();
+            entering.resize(offset + words, 0);
+            for (int candidate : scope) {
+                const int position = compact_connectivity
+                    ? connectivity_slot[candidate] : candidate;
+                entering[offset + position / 64] |= uint64_t{1} << (position % 64);
+            }
+            ++entering_zero_count[scope.front()];
+        }
+    }
     // Exact normalization: a pending component whose entire future reach is
     // one opening's undecided border can be replaced by "opening still
     // uncovered, +1 click". With no later border chord, +1 is its seed click;
@@ -3557,7 +3817,15 @@ static Solution solve_frontier_core(const Model& original_model,
             std::vector<uint8_t> absorption_marks;
             for (const auto& [old_state, old_record] : table) {
                 if (!connectivity_ready[old_state.connectivity_id]) {
-                    const auto& old_signature = connectivity_pool[old_state.connectivity_id];
+                    const auto previous_signature = connectivity_pool[old_state.connectivity_id];
+                    std::vector<uint64_t> with_zeros;
+                    if (!entering_zeros[i].empty()) {
+                        with_zeros.assign(previous_signature.begin(), previous_signature.end());
+                        with_zeros.insert(with_zeros.end(),
+                            entering_zeros[i].begin(), entering_zeros[i].end());
+                    }
+                    const SignatureView old_signature = with_zeros.empty()
+                        ? previous_signature : SignatureView(with_zeros);
                     std::array<ConnectivityTransition, 2> computed;
                     for (int selected = 0; selected <= 1; ++selected) {
                         int closed = 0;
@@ -3745,7 +4013,10 @@ static Solution solve_frontier_core(const Model& original_model,
                     Ops::retain(new_hits, active_after[i]);
                     const auto& connection =
                         connectivity_cache[old_state.connectivity_id][selected];
-                    int new_cost = old_record.cost + selected + connection.closed + factor_cost;
+                    // Baseline 3BV already pays for each opening. Its mandatory
+                    // component now pays through the usual component-closure cost.
+                    int new_cost = old_record.cost + selected + connection.closed
+                        + factor_cost - entering_zero_count[i];
                     uint32_t connectivity_id = connection.connectivity_id;
                     if (connectivity_id != 0 && !opening_patterns[i].empty()) {
                         const auto& signature = next_connectivity_pool[connectivity_id];
@@ -3954,7 +4225,9 @@ static Solution solve_frontier(const Model& original_model,
     auto [model, order_name] = choose_order(
         reduction.model, requested_order, band_size);
     const auto factor_start = profile_enabled ? std::chrono::steady_clock::now() : ordering_start;
-    const FactorPlan factors = make_factor_plan(model);
+    // Zero openings and selected chords share one connectivity objective at
+    // every board size; no separate zero-coverage bits are needed.
+    const FactorPlan factors = make_factor_plan(model, true);
     const auto dp_start = profile_enabled ? std::chrono::steady_clock::now() : factor_start;
     Solution solution;
     if (factors.slot_count <= 64) {

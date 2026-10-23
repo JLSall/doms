@@ -1,5 +1,887 @@
 # Optimization history
 
+## Experiment: common zero-opening representation and budgeted planning (2026-10-23)
+
+Proceed in two independent steps, preserving all pre-existing pending edits.
+First use mandatory zero components at every board size, with ordering
+unchanged. Only after a measurable gain, test representation-aware ordering
+and a deterministic refinement budget. If that second step does not improve
+measured total time, revert it and stop under AGENTS.md; retain the separately
+validated first step. Do not introduce mixed zero handling without evidence
+that the common representation needs it.
+
+### Step 1: retained; mandatory zero components at every size
+
+Use a single portable MSYS2 UCRT64 C++17 `-O3 -DNDEBUG -pthread` harness
+with a runtime representation switch. Run the first 100 boards from each
+fixed Expert seed, ten warmups per set/treatment, and six samples per
+treatment in ABBA/BAAB/ABBA order. Serial execution, high priority, unchanged
+affinity; include construction, reduction and planning in total time, with
+profiling enabled equally. Validate board, 3BV and optimum on every solve.
+
+| Expert set (100 boards) | Coverage baseline median | Mandatory median |
+| --- | ---: | ---: |
+| 1 | 1.283667 s | 0.984751 s |
+| 2 | 1.223405 s | 0.935785 s |
+| 3 | 1.083873 s | 0.832738 s |
+| Sum | 3.590945 s | 2.753273 s |
+
+Total time falls **23.33%** on this diagnostic workload. All 3,600 timed
+solves and 60 warmups match fixed references. These profiled sample timings
+are not a universal speedup claim. Production ordering is unchanged in this
+step; boards above the former representation cutoff execute the same path.
+
+Correctness: the existing assertion-enabled mandatory-zero harness passes
+8,064 oracle solves and legal replays, including forced factor words beyond
+bit 63 and 80/130-contact compact/general connectivity. A temporary extension
+also checks actual production dispatch, candidate reduction and replay:
+11,904 solves pass in total. The portable production build passes the full
+fixed Expert benchmark: 9,000 timed solves plus 300 warmups on 3,000 distinct
+boards, against unchanged board encodings, 3BV and optimum references.
+
+### Step 2: representation-aware ordering and bounded refinement
+
+Plan with zero scopes contributing connectivity only; mine scopes and
+numbered 3BV units contribute factor bits. Restore the complete physical
+model before DP so every opening cost and coverage scope is preserved.
+Use that same planning model for spatial order estimates, smart lines,
+dynamic bands, subset windows and final order comparisons.
+
+Replace the area gate with a deterministic effort budget: estimate frontier
+work using the existing sum of `2^((3*connectivity+2*factors)/8)` across cuts.
+Allow refinement to spend at most one quarter of that score in heuristic
+planning units. Estimate four-pass subset work as `8*q*2^window` plus scope
+classification scans; choose the largest affordable window from 8 through
+16, or skip refinement when none fits. These are heuristic work units, not
+calibrated seconds or a guaranteed savings bound. Keep forced bands free of
+automatic refinement. Explicit `-windows` uses the same deterministic budget,
+so reported refined names replay the chosen permutation.
+
+Test against step 1, independently of the measured representation gain.
+Require exact counts, legal replays, printed-order reproduction, wide state
+representations, and balanced serial total-time measurements across small,
+Expert and fixed large boards. Retain only a measurable improvement.
+
+### Step 2 measurements: retained
+
+The same-binary, profiled Expert comparison uses six serial samples per
+mode in ABBA/BAAB/ABBA order, ten warmups per set/mode, high priority and
+unchanged affinity. Validate all 3,600 timed solves and 60 warmups against
+the fixed board/3BV/optimum references. Compare to step 1, not the original
+coverage engine:
+
+| Expert set (100 boards) | Step 1 median | Planner median |
+| --- | ---: | ---: |
+| 1 | 0.989233 s | 0.955863 s |
+| 2 | 0.945356 s | 0.901267 s |
+| 3 | 0.848031 s | 0.826538 s |
+| Sum | 2.782620 s | 2.683669 s |
+
+This is a further **3.56%** reduction on the profiled Expert sample. None
+of these 300 boards receives automatic window refinement; the gain comes
+from representation-aware order selection. Per-set maximum state peaks
+change from 5,032/7,020/2,723 to 5,032/5,659/2,652.
+
+Separate production-binary bulk samples use 300 boards per difficulty,
+seed 20261023, one thread, and four samples per build in mirrored
+original/step-1/planner and reversed sequences. Every encoded board, 3BV and
+optimum agrees across all 7,200 solves. Median summed solve times are:
+
+| Difficulty | Original dispatch | Step 1 | Final planner |
+| --- | ---: | ---: | ---: |
+| Beginner | 0.076685 s | 0.075603 s | 0.075402 s |
+| Intermediate | 0.609392 s | 0.511810 s | 0.506725 s |
+
+Beginner is effectively unchanged at this timing scale. Intermediate
+improves 16.85% versus the original, mostly from the common representation;
+the additional planner difference is about 1% and is not claimed as a
+reliable standalone gain on this sample. These small-board runs have no
+untimed warmup and use separate binaries, unlike the Expert diagnostic.
+
+Fixed large-board count-only comparisons use one warmup per build/board,
+then six samples per build in ABBA/BAAB/ABBA order, serial high-priority
+execution and unchanged affinity. Check fixed optimum and 3BV every time.
+Initial results comparing step 1 to the planner:
+
+| Fixed board | Step 1 median | Planner median | Reduction |
+| --- | ---: | ---: | ---: |
+| 30x30 / 225 | 0.475407 s | 0.417751 s | 12.13% |
+| 30x30 / 250 | 1.073657 s | 1.064805 s | 0.82% |
+| 35x35 / 335 | 1.863345 s | 0.971867 s | 47.84% |
+| Sum | 3.412409 s | 2.454424 s | 28.07% |
+
+The 30x30/250 difference is within timing variation; the large aggregate
+gain is driven by the other two boards. State peaks change from
+30,176/182,989/175,805 to 48,533/182,979/130,474: the first board gets faster
+while retaining more peak states. No universal speedup or memory reduction
+is claimed, and RSS was not measured.
+
+A second independent ABBA/BAAB/ABBA comparison confirms the gain: medians
+are 0.466083/0.419262 s, 1.095700/1.059545 s, and 1.845866/0.985216 s
+(step 1/planner). The sum falls from 3.407649 to 2.464023 seconds,
+**27.69% lower**, with improvements of 10.05%, 3.30% and 46.63%.
+All 84 warmup/timed large-board solves across both comparisons match the
+fixed optimum and 3BV references.
+
+All three fixed large boards pass full physical-board legal replays at
+253, 279 and 361 clicks. Solving again with each printed order reproduces
+all actions and non-timing JSON fields. A bounded count-only 40x40/444 run
+finishes in 32.613851 solver seconds at the fixed optimum of **484 clicks,
+778 3BV**, with 2,337,318 peak states and 68 factor slots (the wide-factor
+production path). This is a single run, not a paired timing comparison;
+no 40x40 replay or RSS measurement is claimed.
+
+Final solver validation already passes the full fixed Expert benchmark:
+9,000 timed solves plus 300 warmups against unchanged references. Median
+summed solve times for the three fixed sets are 9.368228, 9.000573 and
+8.735521 seconds. This run validates integration; it is not a paired
+full-workload speedup measurement.
+
+The maintained `tests/frontier_planning.cpp` passes 3,456 exhaustive
+production solves with legal replays on all 512 3x3 mine layouts and 64
+seeded 4x4 boards. It also checks printed-order reproduction, preserved
+physical zero coverage, and forced-band behavior on seven sizes, including
+500 and 520 cells. The temporary extended mandatory-zero harness passes
+11,904 oracle/dispatch solves, including wide factors and compact/general
+connectivity. The final solver and maintained test compile with
+`-Wall -Wextra -Wpedantic` without warnings.
+
+Temporary snapshots, harnesses and scripts use ignored `test_unified*`,
+`test_budget*`, `test_planner*` and `test_unified_zero*` paths. Executables
+are ignored; measurements use `*benchmark_results*` and `*benchmark.log`.
+Fixed reference data is unchanged. Raw results are in ignored
+`unified_benchmark_results.*`, `unified_small_benchmark_results.json`,
+`budget_benchmark_results.*`, `budget_large_benchmark_results.json`,
+`budget_large_confirmation_benchmark_results.json`,
+`budget_replay_benchmark_results.json`, and `budget_40_benchmark_results.json`
+under `benchmarks/`, with corresponding `*benchmark.log` files. The final
+`doms.exe` is rebuilt with portable UCRT64 release flags and warnings enabled;
+`git diff --check` passes. Both area-based dispatches are removed. The
+coverage formulation remains available internally for comparative testing;
+production uses mandatory zero components for every size. Mixed per-zero
+representation is not introduced because these measurements do not justify
+its added complexity.
+
+## Experiment: isolate Expert planning costs before replacing the area cutoff (2026-10-22)
+
+Measure three treatments on the current pending solver: established Expert
+automatic order with coverage factors; window refinement alone with coverage
+factors; and mandatory zero components alone with the established order.
+Do not infer either feature's cost from the historical run enabling both.
+Preserve all pending source edits and reference data. An ignored snapshot and
+single harness change only the two dispatch conditions, using runtime switches
+so all treatments share one portable UCRT64 C++17 -O3 -DNDEBUG -pthread binary.
+
+Use the first 100 boards from each of the three fixed Expert seeds, validate
+board encoding, 3BV and optimum against the tracked references on every solve,
+warm ten boards per seed/treatment, and collect four serial samples per
+treatment in mirrored B/W/M/M/W/B/M/W/B/B/W/M order. Raise process priority,
+keep affinity unchanged, include model/reduction/planning in total time, and
+record ordering, DP time, state counts and frontier metrics separately.
+This is a 300-board diagnostic sample, not the complete Expert benchmark.
+
+Only after both isolated measurements, decide whether a shared planner is
+justified. If an isolated optimization fails to improve total time, record
+the result and stop under AGENTS.md without introducing a planner change.
+Temporary harnesses, snapshot and runner use `benchmarks/test_shared_planner*`;
+raw CSV, log and executable use ignored shared_planner result/benchmark names.
+
+### Proposed shared planner, pending measurements and a subsequent experiment
+
+Board area should not be the eventual decision variable. Estimate work over
+all frontier cuts, accounting for graph reach, factor lifetimes, and zero
+border lifetimes from first to last neighboring candidate. Score each zero
+as either an active coverage bit with opening absorption or an entering
+mandatory component with connectivity reach; include signature word counts
+and estimated table memory. Connectivity partitions can grow much faster
+than coverage bits, so a removed factor is not automatically a cheaper state.
+Start with whole-board representation selection if mixed handling cannot be
+implemented and validated simply. Keep empty-scope opening costs unchanged.
+
+Ordering selection and refinement must evaluate the same representation-aware
+cost model. Estimate subset-planning work from actual window sizes, passes
+and scope scans, then require predicted saved DP time to exceed that cost.
+Compare expected total time and memory, not just lexicographic peak width.
+The current `3*graph + 2*factors` score treats zero scopes as factors even
+when mandatory components are selected; it cannot supply this shared model
+unchanged. Calibrate estimates against observed processed/generated states
+and ordering/DP timings on separate small, Expert and large-board samples.
+Keep explicit order replay deterministic. Any later implementation requires
+exact-count and legal-replay checks for both representations, including
+wide factor/signature cases and mixed zero handling if introduced.
+
+### Isolated measurements: window refinement rejected; stop before planner changes
+
+All three treatments used the same executable, built with portable MSYS2
+UCRT64 `-std=c++17 -O3 -DNDEBUG -pthread`. The mirrored sequence above ran
+serially at high process priority with unchanged affinity. Each cell below
+is the median of four total solve-time samples for 100 boards, in seconds;
+model construction, reduction and planning are included. Profiling was
+enabled equally for all treatments to attribute ordering and DP costs.
+
+| Fixed Expert seed/set | Coverage baseline | Windows alone | Mandatory components alone |
+| --- | ---: | ---: | ---: |
+| 15415727658250109428 / 1 | 1.265758 | 5.727494 | 0.983370 |
+| 13781498123793209364 / 2 | 1.192992 | 5.440705 | 0.924594 |
+| 1443274517951773430 / 3 | 1.115707 | 5.330169 | 0.834145 |
+| Sum of per-set medians | 3.574458 | 16.498368 | 2.742109 |
+
+Windows alone increased total time **361.56% (4.62x)**, even though summed
+median DP setup/transition/dominance time decreased 27.68%, from 2.413537
+to 1.745583 seconds. Ordering increased from 0.774035 to 14.389641 seconds.
+Processed states decreased 30.35% and generated states decreased 31.24%.
+The full 16-candidate/four-pass planning budget overwhelms the saved search
+work on these Expert boards. A better width score alone would not fix that
+overhead; refinement needs an explicit estimate of planning cost and savings.
+
+Mandatory components alone reduced total time **23.29%**, with improvements
+on all three sets, while preserving each board's selected automatic order.
+Summed median DP time decreased 33.32% to 1.609323 seconds; processed states
+decreased 34.16%, and generated states decreased 33.70%. Maximum per-board
+peak states by set were 5,032/9,187/3,462 for baseline,
+3,863/4,035/4,015 for windows, and 5,032/7,020/2,723 for mandatory components.
+These results support evaluating mandatory components on small boards and
+rejecting area as sufficient evidence to choose the representation. They
+do not establish that mandatory components win on every board.
+
+All **3,600 timed solves and 90 warmups** matched unchanged board encoding,
+3BV and optimal-click references across 300 distinct fixed Expert boards.
+Per-board search metrics and order names were identical across all four
+repeats within each treatment. No replay, exhaustive oracle, complete
+3,000-board Expert benchmark, memory/RSS measurement, or new large-board
+comparison was performed in this diagnostic. State peaks are only a memory
+proxy; timings with profiling enabled are not production throughput claims.
+
+The historical combined-feature slowdown cannot identify either isolated
+effect; the current measurements specifically identify refinement overhead
+and a separate benefit from mandatory components on the sampled boards.
+Per AGENTS.md, stop after the failed window optimization: no shared planner
+or changed solver dispatch is introduced in this experiment. Both temporary
+switches exist only in the ignored harness snapshot. The production source
+still has SHA-256
+`31becc7fcc31572d53c67a1c2a4b25b355501879c569b0c187ffc90105e20863`,
+identical to the starting pending source. The existing executable and all
+pre-existing workspace edits were preserved. Fixed references were unchanged.
+
+Raw per-board measurements, summary and aggregate log are in ignored
+`benchmarks/shared_planner_results.csv`,
+`benchmarks/shared_planner_results.json`, and
+`benchmarks/shared_planner_benchmark.log`. The temporary runner is
+`benchmarks/test_shared_planner_benchmark.py`; it regenerates the snapshot,
+builds the harness, validates results and checks source preservation.
+
+## Experiment: bound connectivity merges by affordable seed cost (2026-10-22)
+
+Snapshot the pending solver in ignored `test_merge_budget_baseline.cpp`.
+In reverse dominance, cap the common-coarsening calculation by the maximum
+seed cost allowed by the existing minimum-cost, minimum-quasi and primary-key
+bounds. With equal reach unions and nonempty components every A vertex touches
+B, so eliminating A vertices only joins B groups. The penalty starts at
+count(A)-count(B) and increases monotonically with each union. Once it exceeds
+the affordable cap, the existing comparison must fail and can stop immediately.
+Keep all pruning certificates, witness order, objective and search limits.
+
+Build portable MSYS2 UCRT64 C++17 -O3 -DNDEBUG -pthread variants. Differentially
+check bounded merges against an independent full bipartite union-find oracle,
+including multiword signatures and cap boundaries. Run maintained exhaustive
+mandatory-zero tests, then serial balanced paired fixed large-board samples
+with warmups and six samples per build/board. Require reproducible aggregate
+improvement without material board regressions; otherwise revert this experiment,
+record results and stop under AGENTS.md. If retained, run Expert, identical
+large-board replays and bounded 40x40 comparisons. Temporary artifacts use
+existing ignored test_*, *_results*.json, *.exe and *benchmark*.log patterns.
+
+### Measurements: retained; repeatable large-board improvement
+
+Baseline and candidate used identical portable MSYS2 UCRT64
+`-std=c++17 -O3 -DNDEBUG -pthread` flags. The candidate also passed
+`-Wall -Wextra -Wpedantic` without diagnostics. Two serial high-priority
+sessions used one warmup per build/board and six measured samples per
+build/board in ABBA/BAAB/ABBA order, with unchanged CPU affinity.
+Compilation and oracle tests finished before timing. Solve times include
+planning and reduction.
+
+| Board | First baseline / candidate median | Confirmation baseline / candidate median |
+| --- | ---: | ---: |
+| random_30x30_225 | 0.512312 / 0.512084 s | 0.514604 / 0.511121 s |
+| random_30x30_250 | 1.254218 / 1.246942 s | 1.257627 / 1.239817 s |
+| random_35x35_335 | 2.204346 / 2.123918 s | 2.228024 / 2.111024 s |
+
+Sum of per-board medians decreased from 3.9708755 to 3.8829440 seconds
+(**2.21%**) and from 4.0002535 to 3.8619615 seconds (**3.46%**).
+The 35x35 board improved 3.65% and 5.25%; the 30x30/250 board improved
+0.58% and 1.42%. The smallest board was effectively unchanged initially
+(0.04%) and improved 0.68% in confirmation. Retain on reproducible aggregate
+evidence, without claiming improvement for every board or machine.
+
+All 84 warmup/timed solves matched unchanged optimum/3BV references
+253/419, 279/460 and 361/596, with identical candidate counts, sweep orders
+and peak DP states. The independent full bipartite union-find oracle passed
+3,024,593 bounded comparisons, including all bipartite graphs through 4x4
+with empty components removed, 200,000 seeded multiword equal-union cases,
+negative/zero/positive caps, exact cap boundaries and the 128-component limit.
+The maintained mandatory-zero suite passed 8,064 exhaustive-oracle solves,
+legal replays, wide factors and compact/general multiword connectivity.
+
+The bounded helper relies on equal reach unions and nonempty components,
+the same invariant already required by the connected-merge early exit.
+Cost/quasi/primary caps are existing necessary rejection bounds; stopping
+above their minimum cannot discard an affordable witness. Exact quotients,
+witness order, pruning certificates, search limits and references are unchanged.
+Raw samples, source snapshot, differential harness, runners and binaries remain
+in ignored `test_merge_budget*`, `merge_budget_results*.json`, `*.exe` and
+`*benchmark*.log` paths. All pre-existing workspace edits are preserved.
+
+### Expert, replay and 40x40 validation
+
+The retained portable `doms.exe --benchmark` passed all 9,000 timed solves
+and 100 warmup boards per fixed set against unchanged board, 3BV and
+optimal-click references. Median per-set solve totals were 13.582542,
+13.251406 and 12.774498 seconds. These are correctness-validation timings,
+not a paired Expert performance comparison.
+
+Full legal replays on all three smaller fixed large boards matched the
+baseline exactly: actions, all non-timing JSON fields and all four
+processed/generated, conditional-pruning, dominance-pass and dominance-removal
+profile counter lines.
+
+Serial high-priority count-only runs on the fourth fixed board (40x40,
+444 mines), with progress enabled and a 120-second per-build limit, completed
+in **35.482516 seconds baseline / 33.001120 seconds candidate** (6.99% lower).
+Both matched the unchanged **484 optimal clicks / 778 3BV** reference.
+All non-timing JSON fields matched, including 852 reduced candidates,
+2,803,544 peak states, boundary 26, 63 active factors and the selected order.
+Both removed 66,123,447 dominated states. This is a single paired completion
+observation; repeated 40x40 performance and full 40x40 replay were not measured.
+
+The source change is limited to the merge cutoff and its existing-bound cap.
+The root executable is the retained portable candidate. Temporary raw Expert,
+replay and 40x40 results use existing ignored artifact patterns.
+`git diff --check` passed. No follow-on optimization was attempted.
+
+## Experiment: stop connectivity merge scans once connected (2026-10-22)
+
+Profiles of the starting workspace put cross-connectivity dominance at
+0.074 / 0.353 / 1.023 seconds on the first three large boards, including
+0.032 / 0.184 / 0.668 seconds in reverse dominance. Test an early exit in
+its common-coarsening calculation when the B-side union-find has one group.
+Both input signatures have the same reach union and nonempty components;
+every remaining A component must touch B and cannot create another group.
+The exact penalty is then count(A)-1. Preserve all existing pruning results,
+witness order, state counts, objective, and legal replay behavior.
+
+Snapshot the pending source in ignored test_merge_exit_baseline.cpp. Build
+both variants with portable UCRT64 C++17 -O3 -DNDEBUG -pthread. Compare the
+merge calculation with a complete bipartite union-find oracle, including
+multiword signatures, and run the maintained exhaustive mandatory-zero test.
+Measure one warm-up and six serial samples per build per completed fixed
+large board in ABBA/BAAB/ABBA order, high priority and unchanged affinity.
+Validate fixed optima/3BV and identical statistics. Retain only a measurable
+aggregate gain without material board regressions; otherwise restore only
+this experiment, document the result, and stop under AGENTS.md. If retained,
+run Expert validation, large-board replay comparisons, and bounded 40x40 runs.
+Temporary sources, binaries, logs, and JSON use existing ignored patterns.
+
+
+### Measurements: retained; modest local improvement
+
+Both builds used standard portable MSYS2 UCRT64
+`-std=c++17 -O3 -DNDEBUG -pthread`; the candidate also passed
+`-Wall -Wextra -Wpedantic` without diagnostics. Two serial sessions each used
+one warm-up per build per board and six timed samples in ABBA/BAAB/ABBA order,
+at high process priority with unchanged CPU affinity. Compilation and tests
+completed before timing. Solver times include planning and reduction.
+
+| Board | First baseline / candidate median | Confirmation baseline / candidate median |
+| --- | ---: | ---: |
+| random_30x30_225 | 0.511195 / 0.502066 s | 0.516514 / 0.517232 s |
+| random_30x30_250 | 1.248206 / 1.240277 s | 1.274196 / 1.263081 s |
+| random_35x35_335 | 2.188217 / 2.165056 s | 2.236359 / 2.201893 s |
+
+Sum of per-board medians decreased from 3.9476185 to 3.9073990 seconds
+(1.02%) in the first session and from 4.0270695 to 3.9822055 seconds (1.11%)
+in confirmation. The 35x35 board improved 1.06% and 1.54%; the middle board
+improved 0.64% and 0.87%. The smallest board improved 1.79% initially and
+regressed 0.14% in confirmation, within its observed variation. Combined
+process-wall medians also improved on all three boards. Retain this as a
+modest local gain; these measurements do not establish gains on all boards.
+
+All 84 large-board warm-up/timed solves matched unchanged optimal-click/3BV
+references (253/419, 279/460, 361/596). Selected orders, candidate counts,
+and peak DP states matched between builds on every timed sample.
+
+Correctness checks passed 274,963 common-union merge comparisons against
+a complete bipartite union-find oracle: every graph through 4x4 with empty
+components removed, and 200,000 seeded cases with overlapping nonempty
+components, one through four words, and the existing 128-component limit.
+The maintained mandatory-zero suite passed all 8,064 exhaustive-oracle
+solves, legal replays, wide factor bits, and compact/general multiword
+connectivity. The early exit depends on the existing equal-union/nonempty
+component invariant; it is not a general shortcut for arbitrary signatures.
+
+Solver-reported samples in collection order, seconds:
+
+- Session 1, random_30x30_225, baseline: 0.511458, 0.501193, 0.498179, 0.510933, 0.525743, 0.512489.
+- Session 1, random_30x30_225, changed: 0.487940, 0.504132, 0.508750, 0.500000, 0.513579, 0.486763.
+- Session 1, random_30x30_250, baseline: 1.275905, 1.243026, 1.247769, 1.241878, 1.248643, 1.375268.
+- Session 1, random_30x30_250, changed: 1.241360, 1.236475, 1.239193, 1.235596, 1.247034, 1.272125.
+- Session 1, random_35x35_335, baseline: 2.163997, 2.182159, 2.192852, 2.183582, 2.224345, 2.217680.
+- Session 1, random_35x35_335, changed: 2.143633, 2.148644, 2.165800, 2.164313, 2.168742, 2.207547.
+- Session 2, random_30x30_225, baseline: 0.524782, 0.515258, 0.513302, 0.514260, 0.517769, 0.518325.
+- Session 2, random_30x30_225, changed: 0.517683, 0.516781, 0.526616, 0.520632, 0.515784, 0.498628.
+- Session 2, random_30x30_250, baseline: 1.282974, 1.265419, 1.314313, 1.250595, 1.285814, 1.253353.
+- Session 2, random_30x30_250, changed: 1.268489, 1.260258, 1.265903, 1.252403, 1.290634, 1.254350.
+- Session 2, random_35x35_335, baseline: 2.243353, 2.296834, 2.182172, 2.242616, 2.182213, 2.230103.
+- Session 2, random_35x35_335, changed: 2.194703, 2.207151, 2.272403, 2.196635, 2.183169, 2.221887.
+
+Temporary snapshot, differential harness, validation runner, binaries, logs,
+and raw JSON use ignored test_merge_exit*, *_results*.json, *.exe, and
+*benchmark*.log paths. All pre-existing workspace edits and fixed reference
+data remain preserved. No follow-on optimization was started.
+
+### Expert and full replay validation
+
+The retained portable executable passed the full default `doms.exe --benchmark`:
+all 9,000 timed solves and 100 warm-up boards per fixed set matched unchanged
+board, 3BV, and optimal-click references. Median set solve totals were
+13.065976, 12.780903, and 12.474080 seconds. These are correctness-validation
+timings, not a paired Expert performance comparison.
+
+All three completed fixed large boards passed legal action reconstruction.
+Baseline and candidate full replays had identical actions, every non-timing
+JSON field, and all four processed/generated, conditional-pruning,
+dominance-pass, and dominance-removal profile counter lines. The only solver
+change relative to the starting snapshot is the early-exit conditional and
+its explanatory comment. `git diff --check` passed.
+
+### Bounded 40x40 comparison: both completed
+
+Serial high-priority count-only runs, with progress enabled and a 120-second
+per-build limit, completed in 42.095492 seconds baseline and 41.695986 seconds
+candidate. Both independently matched the previously external-only reference
+of **484 optimal clicks / 778 3BV**. This cross-validates that reference on the
+current starting workspace as well as the retained change; older timeout
+observations do not describe the current mandatory-zero solver's capability.
+
+Every non-timing JSON field matched between builds: 852 reduced candidates,
+2,803,544 peak DP states, maximum boundary 26, 63 active factors, and order
+`columns-reverse-dynamic-6.8.4.3.1.1.1.2.5.8.1-windows`. Both reported
+66,123,447 dominated states removed. The single candidate sample was about
+0.95% faster; this is a bounded correctness/completion observation, not a
+repeated performance estimate. No full 40x40 replay was measured.
+
+The retained `doms.exe` is the standard portable build from current source.
+Fixed references remain unchanged. All pre-existing edits remain preserved.
+No follow-on optimization was attempted.
+
+## Experiment: zero-allowance factor dominance on large boards (2026-10-22)
+
+Test a direct missing-good-bit check when the dominance allowance is zero,
+for scalar and multiword factors. The predicate is exactly equivalent to
+population_count(missing) <= 0; positive and negative allowances retain the
+existing path. No pruning certificate, candidate ordering, or objective changes.
+An older zero-penalty shortcut did not establish an Expert benchmark benefit;
+this trial specifically measures the current mandatory-zero large-board path.
+Preserve the starting source, including all pending edits, in ignored
+`benchmarks/test_zero_allowance_baseline.cpp`. Build both with portable UCRT64
+C++17 -O3 -DNDEBUG -pthread. Validate the predicate differentially and run the
+maintained exhaustive mandatory-zero tests, then measure three fixed large
+boards serially with warmups and six balanced samples per variant. Check fixed
+optimum/3BV and state counts. Retain only reproducible improvement without
+material board regressions; otherwise restore this experiment, record results,
+and stop as required by AGENTS.md. If retained, run Expert and bounded 40x40
+comparisons and replays. Temporary files use ignored test_* and *_results*.json.
+
+### Results: reverted; no reliable aggregate improvement
+
+Both builds used MSYS2 UCRT64 C++17 -O3 -DNDEBUG -pthread; the changed build
+also passed -Wall -Wextra -Wpedantic without diagnostics. Two serial
+high-priority sessions each used one warmup and ABBA/BAAB/ABBA, six measured
+solves per build per board, with unchanged CPU affinity. Compilation and
+correctness checks finished before timing. Solver times include ordering.
+
+| Board | First baseline / changed median | Confirmation baseline / changed median |
+| --- | ---: | ---: |
+| 30x30, 225 mines | 0.522203 / 0.513902 s | 0.515012 / 0.526545 s |
+| 30x30, 250 mines | 1.340662 / 1.329399 s | 1.288747 / 1.288243 s |
+| 35x35, 335 mines | 2.279560 / 2.239337 s | 2.302191 / 2.277940 s |
+
+The sum of per-board medians improved 1.44% in the first session but only
+0.32% in confirmation. The smallest board reversed to a 2.24% regression;
+the middle board's initial 0.84% gain fell to 0.04%. These small aggregate
+differences and inconsistent board results do not establish a reliable gain.
+Reject the optimization conservatively.
+
+Correctness passed 1,200,000 independent scalar/multiword predicate checks
+against a bit-clearing population-count oracle, covering negative, zero and
+positive allowances and both zero and nonzero penalties. The maintained
+mandatory-zero test passed 8,064 exhaustive-oracle solves with legal replays,
+including factor bits beyond 63 and compact/general multiword connectivity.
+All 84 large-board solves across both sessions matched fixed optimal-click/3BV
+references (253/419, 279/460, 361/596). Every measured solve retained identical
+candidate counts, order and peak states (30,176, 182,989, 175,805).
+
+Restored the starting solver source and portable baseline executable,
+verified by SHA-256, preserving all pre-existing workspace edits. No solver
+optimization from this experiment remains. Stopped under AGENTS.md; the
+conditional Expert, 40x40 and additional replay runs were not started after
+rejection. Fixed benchmark references remain unchanged. Temporary artifacts
+are ignored in `benchmarks/test_zero_allowance*`,
+`benchmarks/zero_allowance_results.json`,
+`benchmarks/zero_allowance_results_confirmation.json` and root executable paths.
+
+## Experiment: independently solve pieces separated by mandatory zeros (2026-10-22)
+
+Use biconnected blocks of the reduced chord/zero graph on boards larger than
+512 cells. Include chord edges and mine/numbered-target factor stars. Reunite
+every block sharing an optional chord; only mandatory zero vertices may remain
+shared. Solve each resulting piece independently with the existing exact DP,
+then combine selected chords and construct one physical-board replay.
+
+Factor stars force every factor's variables into the same piece, so each mine
+cost and numbered-target reward is charged exactly once. Splitting a mandatory
+articulation zero into k copies increases the component count by exactly k-1,
+independently of selections. Subtract that constant; retain empty base scopes
+as fixed costs. Iterative Tarjan traversal avoids recursive stack growth.
+Keep Expert dispatch and every exact dominance certificate unchanged.
+
+Preserve the starting source (including pending user edits) in ignored
+`benchmarks/test_zero_split_baseline.cpp`. Build baseline/changed with identical
+portable UCRT64 C++17 `-O3 -DNDEBUG -pthread` flags. Check decomposition against
+exhaustive small-board optima, count/replay and multiword factors, including
+synthetic shared zeros, optional articulations and factors crossing a proposed
+split. Run fixed large boards serially with warmups and six balanced samples
+per build/board, validating fixed optimum and 3BV. Retain only a measurable
+improvement without material board regressions; otherwise restore only this
+experiment's source, document the result and stop under AGENTS.md. If retained,
+run full Expert validation and bounded 40x40 count/replay comparisons. Temporary
+artifacts use ignored `test_zero_split*`, `zero_split_results*.json`, root
+executables and `*_benchmark.log` paths.
+
+### Results: reverted; no reliable speed benefit on the fixed large boards
+
+Both builds used MSYS2 UCRT64 C++17 `-O3 -DNDEBUG -pthread`; the changed
+build also passed `-Wall -Wextra -Wpedantic` without diagnostics. Two serial
+high-priority sessions each used one warmup and ABBA/BAAB/ABBA (six measured
+solves per build/board), with unchanged CPU affinity. Compilation and exhaustive
+tests completed before timing. Solver times include decomposition and ordering.
+
+| Board | First baseline / changed median | Confirmation baseline / changed median |
+| --- | ---: | ---: |
+| 30x30, 225 mines | 0.581756 / 0.586124 s | 0.584373 / 0.578704 s |
+| 30x30, 250 mines | 1.539246 / 1.518380 s | 1.497559 / 1.491194 s |
+| 35x35, 335 mines | 2.611810 / 2.603546 s | 2.583698 / 2.570346 s |
+
+Sums of per-board medians were 4.732812 / 4.708050 seconds (0.52% lower)
+and 4.665629 / 4.640244 seconds (0.54% lower). These small differences are
+within the observed timing variation. The first board changes direction;
+pooled 12-sample medians regress on the largest board (2.590494 / 2.593713 s).
+Most importantly, every fixed board remains a single factor-closed piece:
+the complete dependencies prevent the proposed articulation split. Candidate
+counts, sweep orders and peak states remain identical (30,176, 182,989,
+175,805). There is no measured reduction in search work; conservatively reject
+the extra machinery rather than retain it on sub-percent timing evidence.
+
+Correctness validation passed 20,196 piece/combined solves. All 512 layouts
+of 3x3 boards and 128 seeded 4x4 boards matched an independent exhaustive
+mandatory-graph objective, with legal physical-board replays. Another 300
+synthetic models exercised zero cycles, repeated/empty scopes, optional
+articulations and factors crossing potential splits. Rows/columns/auto,
+count/replay and factor bits beyond 63 were exercised. Explicit tests verified
+that a shared mandatory zero splits three ways, while a shared cost factor
+or optional chord reconnects the pieces. All 84 full large-board solves
+(72 measured, 12 warmups) matched fixed optimal-click/3BV references:
+253/419, 279/460 and 361/596.
+
+Restored the starting solver source and the portable baseline executable,
+verified by SHA-256, preserving every pre-existing workspace edit. No new
+maintained tests or solver changes remain from this experiment. Stopped under
+AGENTS.md: conditional Expert and 40x40 count/replay runs were not started.
+Benchmark references are unchanged. Source snapshots, temporary harnesses and
+raw measurements remain ignored in `benchmarks/test_zero_split*`,
+`benchmarks/zero_split_results.json`,
+`benchmarks/zero_split_results_confirmation.json` and root executable paths.
+
+## Experiment: mandatory zero-region connectivity on large boards (2026-10-22)
+
+Zero regions can be represented as mandatory connectivity vertices, without
+separate coverage factors. DOMS currently represents each zero by a coverage reward and an optional
+component, then normalizes some equivalent states by opening absorption.
+Test the mandatory representation for boards larger than 512 cells. Introduce
+one component at each nonempty zero scope's first decision, remove its coverage
+factor, and subtract its already-counted 3BV click when it enters. Component
+closure pays the opening/chain-start click. Keep empty scopes as fixed 3BV costs.
+Allocate contact slots for all zero neighbors, including their first candidate,
+and prevent reuse at a cut where entering components still need the old slot.
+Keep the existing Expert path, candidate reduction, ordering and exact dominance.
+
+Exactness: fix any selected chord set. Adding all zero vertices leaves each
+covered zero in a selected-chord component and each uncovered zero as its own
+component. Thus `mandatory components = chord components + uncovered zeros`.
+Charging these components once, retaining numbered-target coverage costs, and
+omitting zero coverage costs preserves the objective for every chord subset.
+The baseline correction prevents paying for a nonempty-scope zero twice;
+zero scopes with no candidates never enter and retain their fixed baseline.
+
+Preserve starting source and all pending user edits in ignored
+`benchmarks/test_mandatory_zero_baseline.cpp`. Build portable UCRT64 C++17
+-O3 -DNDEBUG -pthread versions. Validate exhaustive small-board optima and
+replays with mandatory mode explicitly forced, including wide factor words.
+Measure fixed 30x30 and 35x35 boards serially with warmups and balanced paired
+samples; check fixed counts and 3BV. Keep only measurable improvement; otherwise
+restore this experiment's source, document results and stop under AGENTS.md.
+If retained, run fixed Expert validation, large-board replay, and bounded 40x40
+comparisons. Temporary artifacts use ignored test_* and *_results*.json paths.
+
+### Measurements: retained
+
+Both DOMS builds use MSYS2 UCRT64 C++17 `-O3 -DNDEBUG -pthread`; the changed
+build also passes `-Wall -Wextra -Wpedantic`. Serial high-priority measurements
+use one warmup per build/board followed by ABBA/BAAB/ABBA, six samples per
+build/board, with unchanged CPU affinity. Timings include model construction,
+reduction and ordering. Every solve matches fixed optimal-click/3BV references.
+All pending source and documentation edits present at task start are preserved.
+
+| Board | Baseline median | Changed median | Speedup | Peak states baseline / changed |
+| --- | ---: | ---: | ---: | ---: |
+| 30x30, 225 mines | 1.258700 s | 0.600152 s | 2.10x | 71,286 / 30,176 |
+| 30x30, 250 mines | 1.872087 s | 1.561523 s | 1.20x | 182,989 / 182,989 |
+| 35x35, 335 mines | 6.908273 s | 2.656459 s | 2.60x | 469,844 / 175,805 |
+
+Sum of per-board medians falls from 10.039059 to 4.818133 seconds: **52.01%
+less time, or 2.08x throughput on this fixed workload**. All three improve.
+These local measurements do not imply a uniform speedup across large boards.
+Candidate counts and sweep orders are identical between DOMS builds. The
+representation changes the retained connectivity states and removes zero
+coverage bits; on the middle board the peak remains unchanged, but other
+layers and transition work can still shrink.
+
+Correctness: maintained `tests/mandatory_zero_connectivity.cpp` passes 8,064
+solves against exhaustive subset optima, with legal action validation for every
+replay. It covers all 512 3x3 mine layouts, 128 seeded 4x4 boards, and 32 sparse
+30x30 boards restricted to 12 decisions, using row/column/auto ordering,
+count-only/replay, and forced factor words beyond bit 63. Synthetic 80- and
+130-contact zero borders also pass, exercising compact two-word and general
+three-word connectivity. The initial temporary small-board harness additionally
+passed 5,760 solves and 8,422,528 independent population-count checks.
+
+The three fixed 30x30/35x35 boards also pass full physical-board legal replays
+with exact counts 253, 279, and 361. A bounded serial 40x40/444 run finds the
+fixed optimum **484 clicks, 778 3BV** in 54.640655 solver seconds for changed
+DOMS (2,803,544 peak states). Original DOMS exceeds the 90-second process
+limit. These are single runs, not repeated medians. The 40x40 DOMS replay also
+exceeds 90 seconds; only its count-only solve completed. No completed 40x40
+replay is claimed.
+
+Final standard validation: plain `doms.exe --benchmark` passes all 9,000 timed
+solves plus 300 warmups against unchanged board encodings, 3BV and exact-click
+references (3,000 distinct Expert boards, three repeats). Per-set median summed
+solve times are 14.320246, 14.010953 and 13.485048 seconds. This validates the
+standard path; no before/after Expert speedup is claimed. `git diff --check`
+passes. The final executable was rebuilt with portable UCRT64 flags and warnings
+enabled before large-board replay/40x40 and Expert validation.
+
+Raw timings and temporary source snapshots/harnesses/executables remain ignored:
+`benchmarks/mandatory_zero_results.json`,
+`benchmarks/mandatory_zero_comparison_results.json`, `benchmarks/test_mandatory_zero*`,
+`benchmarks/mandatory_zero_40_results.json`,
+`benchmarks/mandatory_zero_expert_benchmark.log`, and root executable files.
+Fixed benchmark references are unchanged.
+
+## Experiment: check forward connectivity witnesses lazily (2026-10-22)
+
+Forward dominance currently proves all scalar-feasible connectivity relations
+before examining any target states. Collect the same scalar-feasible IDs first,
+prefer the smallest cached quasi-score/cost, and prove each relation only when
+there are still undominated targets. Compact the target list stably after a
+successful witness. Keep every original survivor available as a witness,
+including cross-dominated states. All exact containment, matching, factor-cost,
+and compensated-dominance certificates remain unchanged. Thus a target is
+removed iff at least one of the same witnesses proves dominance; witness order
+cannot change the result. Preserve every pre-existing workspace edit.
+
+Build both versions with portable MSYS2 UCRT64 C++17 -O3 -DNDEBUG -pthread.
+Validate actual pruning survivors/counters differentially, small-board exact
+optima/replays and forced multiword factors. Run the first three fixed large
+boards serially with one warm-up and six balanced samples per build, including
+planning time and checking fixed exact-click/3BV references. Retain only a
+measurable aggregate improvement without material per-board regression;
+otherwise revert only this experiment, document results, and stop. If retained,
+run full fixed Expert validation, large-board replay, and bounded serial 40x40
+comparisons. Temporary artifacts use ignored benchmarks/test_lazy_forward*,
+benchmarks/lazy_forward_results*.json, and root executable paths.
+
+
+### Results: reverted; no reproducible speed improvement
+
+Both executables used identical portable UCRT64 optimization flags; the
+changed build also passed -Wall -Wextra -Wpedantic without diagnostics.
+Two serial high-priority benchmark sessions each used one warm-up per build
+per board, then ABBA/BAAB/ABBA (six measured solves per build per board).
+CPU affinity was unchanged and solver time includes ordering. Compilation
+and exhaustive/differential validation finished before measurement.
+
+| Board | First baseline / changed median | Confirmation baseline / changed median |
+| --- | ---: | ---: |
+| random_30x30_225 | 1.091870 / 1.095806 s | 1.246177 / 1.248333 s |
+| random_30x30_250 | 1.579305 / 1.572399 s | 2.008978 / 2.064158 s |
+| random_35x35_335 | 5.695595 / 5.660725 s | 7.127778 / 7.279758 s |
+
+Sums of per-board medians were 8.366771 / 8.328930 seconds in the first
+session (0.45% lower) and 10.382934 / 10.592249 seconds in confirmation
+(2.02% higher). The first board regressed in both sessions; the other two
+small initial gains reversed in confirmation. There is substantial timing
+drift, so the initial sub-percent aggregate gain does not establish a
+reproducible improvement. Reject the experiment conservatively.
+
+Correctness validation passed:
+
+- 2,000 assertion-enabled differential pruning tables compared the actual
+  original and changed functions. Surviving states, costs, chosen histories,
+  and exact/forward/reverse pruning counts matched. Tables covered scalar
+  and one-to-four-word factors, count-only and replay records, one-to-three
+  connectivity words, overlapping component reaches, bit 63, empty
+  signatures, and common-union buckets large enough to use pair postings.
+- All 512 layouts on 3x3 boards and 64 seeded random 4x4 boards: 4,608 exact
+  solves matched exhaustive candidate-subset optima in rows/columns/auto,
+  count-only/replay, and forced multiword factors. Every replay passed legal
+  action validation. The 8,422,528 population-count oracle checks also passed.
+- 36 baseline/changed full-solver comparisons across three standard
+  difficulties, six seeds, and count-only/replay matched every non-timing
+  JSON field, exact actions, and all four profiling counter lines.
+- All 84 large-board solves (including warm-ups across both sessions) matched
+  fixed optimal-click/3BV references: 253/419, 279/460, and 361/596.
+  All 72 measured records matched candidate counts, order names, and peak
+  states between builds (71,286, 182,989, and 469,844).
+
+Restored the starting solver source byte-for-byte and doms.exe from the
+baseline executable, verified by SHA-256. All pre-existing workspace edits
+and benchmark references remain intact. Stopped under AGENTS.md; conditional
+full Expert, large-board replay, and bounded 40x40 comparisons were not run
+after rejection. No new speedup or 40x40 completion is claimed. Raw timing
+samples, source snapshot, harnesses, and binaries remain in the ignored paths
+listed above. git diff --check passed.
+
+## Experiment: cancel opposite identical factor scopes (2026-10-22)
+
+At factor planning, pair identical nonempty mine and base scopes and remove
+both indicators. Their +1 and -1 hit costs cancel for every possible chord
+selection, preserving the complete objective without adding weights or
+changing the model. Preserve uncancelled multiplicities. Keep all opening
+connectivity edges; disable opening absorption only for cancelled opening
+rewards, since that normalization requires its original reward bit.
+
+Preserve all starting workspace edits in `benchmarks/test_cancel_baseline.cpp`.
+Build both variants using identical portable MSYS2 UCRT64 C++17
+`-O3 -DNDEBUG -pthread` flags. Validate exhaustive small-board optima, replay,
+and forced multiword factors. Benchmark the first three fixed large boards
+serially with one warm-up and six balanced samples per build, checking the
+fixed exact-click and 3BV references on every solve. Retain only measurable
+aggregate improvement without material per-board regression; otherwise revert
+this experiment and stop. If retained, run the full fixed Expert benchmark,
+large-board replays, and bounded serial 40x40 comparisons. Temporary harnesses,
+snapshots, executables and results use existing ignored artifact patterns.
+
+### Results: reverted; improvement not established reliably
+
+Both builds used identical portable UCRT64 optimization flags; the changed
+build also compiled with `-Wall -Wextra -Wpedantic` without diagnostics.
+Two complete serial high-priority timing sessions each used one warm-up and
+six samples per build per board in ABBA/BAAB/ABBA order. No compilation or
+other solver jobs from this session overlapped measurements. CPU affinity
+was unchanged; solver times include ordering and factor planning.
+
+| Board | First baseline / changed median | Confirmation baseline / changed median |
+| --- | ---: | ---: |
+| 30x30, 225 mines | 1.181777 / 1.169349 s | 1.266345 / 1.259221 s |
+| 30x30, 250 mines | 1.749054 / 1.727848 s | 1.733054 / 1.786886 s |
+| 35x35, 335 mines | 6.941280 / 6.856521 s | 6.496126 / 6.391353 s |
+
+Sums of medians were 9.872111 / 9.753717 seconds (1.20% lower) in the
+first session and 9.495525 / 9.437459 seconds (0.61% lower) in confirmation.
+However, the second board changed from 1.21% faster to 3.11% slower, and
+timing variation/drift exceeded the small aggregate differences. Pooled
+12-sample medians per board were respectively 1.227608 / 1.237922,
+1.749054 / 1.746140, and 6.568886 / 6.529289 seconds: only 0.34% lower in
+aggregate, with a regression on the first board. No reliable improvement
+without per-board regression was established; conservatively reject this
+experiment rather than claim a speedup from these noisy measurements.
+
+Every warm-up and measured solve matched fixed optimal-click/3BV references
+(253/419, 279/460, 361/596). Candidate counts, chosen orders, and peak DP
+states were unchanged (71,286, 182,989, 469,844). Nonempty factor counts fell
+621 to 611, 690 to 680, and 915 to 909. The unmeasured 40x40 factor-plan
+diagnostic fell 1,195 to 1,179 factors, leaving 65 factor slots; it was not
+a completed solve or a speed measurement.
+
+Correctness checks passed all 512 mine layouts on 3x3 boards and 64 seeded
+4x4 boards: 4,608 exact solves matched exhaustive candidate-subset optima
+across rows/columns/auto, count-only/replay, and forced multiword factors.
+All replays passed legal-action validation. Another 203,698 exhaustive
+selection checks on 1,000 synthetic scope models confirmed identical factor
+costs, including repeated/empty scopes, unequal multiplicities, and opening
+factor mappings. The existing 8,422,528 population-count oracle checks passed.
+
+Restored the starting solver source byte-for-byte and `doms.exe` from the
+baseline build (both verified by SHA-256), preserving all pre-existing edits.
+Stopped optimization work under AGENTS.md; conditional full Expert,
+large-board replay, and bounded 40x40 runs were not started after rejection.
+No new solver speedup or 40x40 completion is claimed. Raw samples and temporary
+harnesses use ignored `benchmarks/test_cancel*`,
+`benchmarks/cancel_results.json`, and
+`benchmarks/cancel_confirmation_results.json` paths. Benchmark references
+were unchanged.
+
+## Large-board review: refined sweep selection (2026-10-22)
+
+DOMS uses exact frontier connectivity DP with bounded subset ordering, compact
+connectivity signatures, transition caching, and dominance. The fixed 35x35
+board previously reached 492,102 peak states and took 6.926 seconds in a local
+run. Those historical results are not measurements of today's pending DOMS
+source. They support investigating state-space size,
+  but do not isolate the contribution of each structural difference.
+
+Tested selecting among multiple refined sweeps: preserve the existing refined
+winner, refine the best weighted-peak/work seed from each orientation and
+direction, and select the smallest refined score. This is an ordering-only
+experiment; all candidate subsets remain subject to exact search. Standard
+automatic Expert planning was unchanged.
+
+### Results: reverted; no new solver optimization retained
+
+Both builds used MSYS2 UCRT64 and identical portable
+`-std=c++17 -O3 -DNDEBUG -pthread` flags. Baseline includes all source edits
+present at task start. Runs were serial at high process priority with unchanged
+CPU affinity: one warm-up per build per board, then ABBA/BAAB/ABBA (six timed
+samples per build). Solver times include ordering. Every warm-up and measured
+solve matched the fixed optimal-click and 3BV references.
+
+| Board | Baseline median | Experimental median | Peak states baseline / experiment |
+| --- | ---: | ---: | ---: |
+| 30x30, 225 mines | 1.097397 s | 1.734995 s | 71,286 / 71,286 |
+| 30x30, 250 mines | 1.634266 s | 6.054032 s | 182,989 / 418,452 |
+| 35x35, 335 mines | 6.158841 s | 6.749043 s | 469,844 / 469,844 |
+
+Sum of medians increased from 8.890504 s to 14.538070 s (63.52% slower).
+The first and third boards chose exactly the baseline order and paid extra
+planning overhead. On the second board the surrogate score selected a worse
+order, more than doubling peak states. Weighted frontier estimates are not
+reliable enough to justify this broader search as implemented.
+
+Restored the starting solver source byte-for-byte (verified SHA-256), restored
+`doms.exe` from the baseline build, and stopped optimization work under
+AGENTS.md. All pre-existing README/source edits and reference data remain.
+Conditional exhaustive/replay, full Expert, and 40x40 validation were not run
+after the experiment failed acceptance. No new performance improvement or
+40x40 completion is claimed. `git diff --check` passed.
+
+Temporary source snapshot, harness, raw samples, and executables use ignored
+paths: `benchmarks/test_multisweep_baseline.cpp`,
+`benchmarks/test_multisweep_benchmark.py`,
+`benchmarks/multisweep_results.json`, `doms_baseline.exe`, and `doms.exe`.
+Factor compression and exact decomposition remain review findings; neither
+was implemented or tested in this experiment.
+
 ## Experiment: contiguous reachability-bucket signature IDs
 
 Replace each dominance bucket's independently allocated signature-ID vector
@@ -3075,3 +3957,62 @@ solver JSON/profile comparisons, runner, raw benchmark logs, and
 `results.json` remain in `%TEMP%\doms-band-filter-20261022`, outside version
 control. All pre-existing edits were preserved. `doms.exe` was rebuilt from
 the retained source. `git diff --check` passed.
+
+## Experiment: advance forward-dominance witness prefixes (2026-10-22)
+
+Preserve the starting workspace, including pending changes, in ignored
+`benchmarks/test_forward_prefix_baseline.cpp`. Forward connectivity dominance
+currently checks the sorted-key cutoff for every witness. Traverse each coarse
+signature's sorted witnesses against the sorted fine targets, advancing an
+eligible prefix monotonically. Skip targets already proved dominated, keeping
+all witnesses until the existing deferred erasure. Each target receives the
+same witnesses in the same order; only independent target checks are reordered.
+No objective, certificate, order planner, replay rule, or search limit changes.
+
+Build both variants with standard portable MSYS2 UCRT64 C++17
+`-O3 -DNDEBUG -pthread`. Validate exhaustive small-board optima, legal replay,
+forced refined orders, and multiword factors. Measure one warm-up and six
+samples per build per board in serial ABBA/BAAB/ABBA order on the first three
+fixed large boards, with high process priority and unchanged affinity. Verify
+fixed optimal counts/3BV and identical search statistics. Retain only measurable
+aggregate improvement without material per-board regression. If retained, run
+the full fixed Expert benchmark, large-board replay comparisons, and bounded
+serial 40x40 runs. Otherwise revert only this experiment, record results, and
+stop under AGENTS.md. Temporary artifacts use existing ignored patterns.
+
+### Results: reverted; no established aggregate speedup
+
+Both builds used portable MSYS2 UCRT64
+`-std=c++17 -O3 -DNDEBUG -pthread`. Timing ran serially after compilation
+and correctness checks, at high process priority with unchanged affinity.
+Each board received one warm-up per build and six timed samples per build
+in ABBA/BAAB/ABBA order. Solve times include planning and reduction.
+
+| Fixed large board | Baseline median | Experiment median | Change |
+| --- | ---: | ---: | ---: |
+| 30x30, 225 mines | 0.5202025 s | 0.5059190 s | 2.75% faster |
+| 30x30, 250 mines | 1.2517110 s | 1.2541425 s | 0.19% slower |
+| 35x35, 335 mines | 2.2002245 s | 2.2059665 s | 0.26% slower |
+
+Sum of medians: 3.9721380 s baseline versus 3.9660280 s experiment,
+only 0.15% lower. The small aggregate difference is within observed variation;
+no measurable aggregate improvement was established. Reverted this
+experiment's source change and restored `doms.exe` from the baseline build.
+Stopped under AGENTS.md; conditional Expert, large-board replay comparisons,
+and bounded 40x40 comparisons were not started. No new speedup is retained.
+The unresolved 40x40 result remains unchanged.
+
+All measured solves matched unchanged optimal-click/3BV references:
+253/419, 279/460, and 361/596. Selected orders, candidate counts, and peak
+states matched between builds on every sample. These timings reflect the
+current starting workspace, including its pending mandatory-zero changes,
+and should not be compared directly to older experiments' absolute timings.
+The assertion-enabled existing small-board harness passed all 512 3x3 mine
+layouts and 64 seeded random 4x4 boards: 5,760 exact solves matched exhaustive
+candidate-subset optima, including legal replay, forced refined orders, and
+multiword factors. Its 2,258,137 signed-key checks and 8,422,528 independent
+population-count checks also passed.
+
+Raw samples are preserved in ignored `benchmarks/forward_prefix_results.json`;
+the ignored snapshot, runner, and binaries use existing artifact patterns.
+All pre-existing workspace edits and fixed reference data remain preserved.
