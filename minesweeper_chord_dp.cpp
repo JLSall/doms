@@ -2482,6 +2482,16 @@ public:
         deleted_slots_ = 0;
     }
 
+    // Reuse dense layer capacity, but destroy records now so wide factor and
+    // chosen-history allocations do not survive into the dominance pass.
+    // Rebuild the index with the next layer's normal reserve calculation.
+    void clear_for_reuse() {
+        entries_.clear();
+        alive_.clear();
+        live_size_ = 0;
+        release_lookup_index();
+    }
+
     void reserve(size_t count) {
         if (count > static_cast<size_t>(DELETED) - 1) {
             throw std::length_error("too many DP states for the flat table");
@@ -2926,13 +2936,16 @@ static size_t prune_dominated(FactorTable<FactorBits, TrackChosen>& table,
     using Item = typename FactorTable<FactorBits, TrackChosen>::value_type*;
     // Entries cannot move during pruning. Keep one direct pointer and derive
     // the final sort field from the hit counts instead of storing it again.
-    // This makes the cache record 32 rather than 48 bytes on 64-bit builds.
+    // Scalar factor states have at most 64 hits. Narrow only their counts,
+    // placing them after the score so scalar records fit in 24 bytes on
+    // 64-bit builds. Wide factor states retain full integer counts.
+    using HitCount = std::conditional_t<std::is_same_v<FactorBits, uint64_t>, uint8_t, int>;
     struct CachedItem {
         Item item;
         uint64_t key;
-        int base_hits;
-        int flag_hits;
         int quasi_score;
+        HitCount base_hits;
+        HitCount flag_hits;
         bool exact_dominated;
         bool cross_dominated;
 
@@ -3102,7 +3115,8 @@ static size_t prune_dominated(FactorTable<FactorBits, TrackChosen>& table,
         const uint64_t key = dominance_primary_key(item->second.cost, base_hits);
         const int quasi_score = item->second.cost + base_hits - flag_hits;
         buckets[bucket].entries.push_back(
-            CachedItem{&*item, key, base_hits, flag_hits, quasi_score, false, false});
+            CachedItem{&*item, key, quasi_score, static_cast<HitCount>(base_hits),
+                       static_cast<HitCount>(flag_hits), false, false});
     }
     for (auto& bucket : buckets) {
         std::sort(bucket.entries.begin(), bucket.entries.end(),
@@ -3780,6 +3794,7 @@ static Solution solve_frontier_core(const Model& original_model,
     size_t opening_absorptions = 0;
 
     const auto loop_start = profile_enabled ? std::chrono::steady_clock::now() : core_start;
+    TableType next;
     for (int i = 0; i < q; ++i) {
         if (profile_enabled) profile.processed_states += table.size();
         boundary_size += boundary_delta[i];
@@ -3789,7 +3804,6 @@ static Solution solve_frontier_core(const Model& original_model,
         const int current_connectivity_slot = compact_connectivity
             ? connectivity_slot[i] : i;
 
-        TableType next;
         const size_t desired_capacity = table.size() > (std::numeric_limits<size_t>::max() - 16) / 2
             ? std::numeric_limits<size_t>::max() : table.size() * 2 + 16;
         next.reserve(desired_capacity);
@@ -4121,13 +4135,10 @@ static Solution solve_frontier_core(const Model& original_model,
             }
         }
 
-        // The previous layer and connectivity pool are no longer needed. Release
-        // them before dominance pruning so they do not overlap the largest
-        // temporary structures of the new layer.
-        {
-            TableType released;
-            table.swap(released);
-        }
+        // Destroy previous records and release the connectivity pool before
+        // dominance pruning. Retain only the dense table capacity for reuse
+        // when constructing the following layer.
+        table.clear_for_reuse();
         {
             ConnectivityPool released;
             connectivity_pool.swap(released);
@@ -4157,7 +4168,7 @@ static Solution solve_frontier_core(const Model& original_model,
                     std::chrono::steady_clock::now() - prune_start).count();
             } else ++profile.deferred_layers;
         }
-        table = std::move(next);
+        table.swap(next);
         connectivity_pool.swap(next_connectivity_pool);
         dominated_total += removed;
         peak_states = std::max(peak_states, table.size());
